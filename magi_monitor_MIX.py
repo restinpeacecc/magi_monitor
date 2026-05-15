@@ -299,7 +299,7 @@ def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     if val >= crit_limit:
         return "bold red1",      2.5,  "!! OVERDRIVE !!"
     if val >= warn_limit:
-        return "bold gold1",     1,  "HIGH-WATTAGE"
+        return "bold gold1",     1,  "PC-HIGH"
     if val >= safe_limit:
         return "bold green",     0.5,  "ACTIVE"
     return "cyan",               0,    "[reverse] ECO [/reverse]"
@@ -510,7 +510,7 @@ def build_casper() -> Panel:
     
     gpu_snapshot = state.get_gpu_freq_snapshot(600)
 
-    if state.gpu_load > 60 and state.vram_used_pct > 60:                        # 最高优先级：满负荷
+    if state.gpu_load > 60 and state.vram_used_pct > 50:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
     elif state.gpu_load > 30 and state.vram_used_pct > 30:                      # 中负荷
