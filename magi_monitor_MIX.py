@@ -513,13 +513,13 @@ def build_casper() -> Panel:
     
     gpu_snapshot = state.get_gpu_freq_snapshot(600)
 
-    if state.gpu_load > 60 and state.vram_used_pct > 50:                        # 最高优先级：满负荷
+    if state.gpu_load >= 60 and state.vram_used_pct >= 50:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
-    elif state.gpu_load > 30 and state.vram_used_pct > 30:                      # 中负荷
+    elif state.gpu_load >= 30 and state.vram_used_pct >= 30:                      # 中负荷
         on = (time.time() * 2) % 2 < 1                  # 1 Hz
         ai = "[bold gold1][reverse] AI-ACTIVE [/reverse][/]" if on else "[bold gold1] AI-ACTIVE [/]"
-    elif state.gpu_load > 10:                                     # 低负荷（仅 GPU 核心有活动）
+    elif state.gpu_load >= 10:                                     # 低负荷（仅 GPU 核心有活动）
         on = (time.time() * 1) % 2 < 1                  # 0.5 Hz
         ai = "[bold green][reverse] INIT [/reverse][/]" if on else "[bold green] INIT [/]"
     else:
@@ -801,7 +801,7 @@ class MAGIApp(App):
         state.pstat_crit = (total_pwr >= 300) 
         
         # COMP (Casper) 的临界判断基于 GPU 负载和 VRAM 使用率 (与 build_casper 中的最高等级逻辑一致)
-        state.comp_crit = (state.gpu_load > 60 and state.vram_used_pct > 60)
+        state.comp_crit = (state.gpu_load >= 60 and state.vram_used_pct >= 60)
 
         # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
