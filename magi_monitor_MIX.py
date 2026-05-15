@@ -7,6 +7,7 @@ rich.live + msvcrt → Textual (非同期イベントループ・スレッドワ
 import re
 import subprocess
 import time
+import threading
 from datetime import datetime
 
 import psutil
@@ -80,6 +81,23 @@ class MagiState:
         self.pstat_blink_on: bool = False
         self.comp_blink_on: bool = False
         
+        # 新增：保护历史列表的锁
+        self._list_lock = threading.Lock()
+        
+    # ── 历史列表快照方法（线程安全）──────────────────────────────
+
+    def get_cpu_freq_snapshot(self, maxlen: int = 0) -> list[float]:
+        with self._list_lock:
+            if maxlen:
+                return list(self.cpu_freq_history[-maxlen:])
+            return list(self.cpu_freq_history)
+
+    def get_gpu_freq_snapshot(self, maxlen: int = 0) -> list[float]:
+        with self._list_lock:
+            if maxlen:
+                return list(self.gpu_freq_history[-maxlen:])
+            return list(self.gpu_freq_history)
+
     # ── 警报 ────────────────────────────────────────────────────────────────
 
     def update_alert(self, cpu_temp: float, gpu_temp: float):
@@ -137,14 +155,16 @@ class MagiState:
 
     def add_cpu_freq(self, val: float):
         """由 worker 线程调用，追加频率并保持长度"""
-        self.cpu_freq_history.append(val)
-        if len(self.cpu_freq_history) > self.CPU_FREQ_HISTORY_MAX:
-            self.cpu_freq_history = self.cpu_freq_history[-self.CPU_FREQ_HISTORY_MAX:]
+        with self._list_lock:
+            self.cpu_freq_history.append(val)
+            if len(self.cpu_freq_history) > self.CPU_FREQ_HISTORY_MAX:
+                self.cpu_freq_history = self.cpu_freq_history[-self.CPU_FREQ_HISTORY_MAX:]
 
     def add_gpu_freq(self, val: float):
-        self.gpu_freq_history.append(val)
-        if len(self.gpu_freq_history) > self.GPU_FREQ_HISTORY_MAX:
-            self.gpu_freq_history = self.gpu_freq_history[-self.GPU_FREQ_HISTORY_MAX:]
+        with self._list_lock:
+            self.gpu_freq_history.append(val)
+            if len(self.gpu_freq_history) > self.GPU_FREQ_HISTORY_MAX:
+                self.gpu_freq_history = self.gpu_freq_history[-self.GPU_FREQ_HISTORY_MAX:]
 
     def add_net_dn(self, kbps: float):
         """记录下载速度并更新全局最大值"""
@@ -342,8 +362,10 @@ def build_header() -> Panel:
 
 def build_melchior() -> Panel:
 
+    cpu_snapshot = state.get_cpu_freq_snapshot(600)
+
     spark = generate_braille_trend(
-        state.cpu_freq_history, 
+        cpu_snapshot, 
         width=22, 
         y_range=(3000.0, 5000.0),
         low_color="cyan", 
@@ -351,7 +373,7 @@ def build_melchior() -> Panel:
         high_color="red1"
     )
 
-    history = state.cpu_freq_history[-600:]   # 最多 5 分钟
+    history = cpu_snapshot   # 改用线程安全的快照
     if history:
         f_min = min(history)
         f_max = max(history)
@@ -468,6 +490,8 @@ def build_balthasar() -> Panel:
 
 def build_casper() -> Panel:
     
+    gpu_snapshot = state.get_gpu_freq_snapshot(600)
+
     if state.gpu_load > 60 and state.vram_used_pct > 60:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
@@ -480,7 +504,7 @@ def build_casper() -> Panel:
     else:
         ai = "[cyan][reverse] IDLE [/reverse][/]"       # 空闲
 
-    history = state.gpu_freq_history[-600:]   # 最多 1 分钟
+    history = gpu_snapshot   # 改用线程安全的快照
     if history and len(history) >= 2:
         f_min = min(history)
         f_max = max(history)
