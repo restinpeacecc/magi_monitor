@@ -473,7 +473,7 @@ def build_casper() -> Panel:
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
     elif state.gpu_load > 30 and state.vram_used_pct > 30:                      # 中负荷
         on = (time.time() * 2) % 2 < 1                  # 1 Hz
-        ai = "[bold gold1][reverse] AI-ACTIVE [/reverse][/]" if on else "[bold red1] AI-ACTIVE [/]"
+        ai = "[bold gold1][reverse] AI-ACTIVE [/reverse][/]" if on else "[bold gold1] AI-ACTIVE [/]"
     elif state.gpu_load > 10:                                     # 低负荷（仅 GPU 核心有活动）
         on = (time.time() * 1) % 2 < 1                  # 0.5 Hz
         ai = "[bold green][reverse] INIT [/reverse][/]" if on else "[bold green] INIT [/]"
@@ -532,7 +532,7 @@ class MelchiorPanel(Static):
         panel = build_melchior()
         # 新增：根据状态闪烁边框
         if state.fuse_crit and state.fuse_blink_on:
-            panel.border_style = "bold red"
+            panel.border_style = "heavy red"
             panel.border_title_style = "bold red"
         else:
             # 恢复默认样式
@@ -546,7 +546,7 @@ class BalthasarPanel(Static):
         panel = build_balthasar()
         # 新增：根据状态闪烁边框
         if state.pstat_crit and state.pstat_blink_on:
-            panel.border_style = "bold red"
+            panel.border_style = "heavy red"
             panel.border_title_style = "bold red"
         else:
             # 恢复默认样式
@@ -560,7 +560,7 @@ class CasperPanel(Static):
         panel = build_casper()
         # 新增：根据状态闪烁边框
         if state.comp_crit and state.comp_blink_on:
-            panel.border_style = "bold red"
+            panel.border_style = "heavy red"
             panel.border_title_style = "bold red"
         else:
             # 恢复默认样式
