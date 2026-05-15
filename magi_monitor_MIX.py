@@ -184,6 +184,9 @@ class MagiState:
         if dt > 0:
             self.disk_r = (now_io.read_bytes  - self._last_disk_io.read_bytes)  / dt / 1024 / 1024
             self.disk_w = (now_io.write_bytes - self._last_disk_io.write_bytes) / dt / 1024 / 1024
+        else:
+            self.disk_r = 0.0
+            self.disk_w = 0.0
         self._last_disk_io = now_io
         self._last_time    = now_time
 
@@ -705,7 +708,11 @@ class MAGIApp(App):
         """事件循环中频繁调用的轻量级调度器。实际处理在worker线程中。"""
         self._collect()
 
-        # 新增：处理面板边框闪烁逻辑 (2.5 Hz)
+        # 在主线程中处理 alert 和刷新（替代 worker 中的 call_from_thread）
+        self._check_alert(state.cpu_temp, state.gpu_temp)
+        self._refresh_all()
+
+        # 处理面板边框闪烁逻辑 (2.5 Hz)
         current_time = time.time()
         blink_state = (int(current_time * 5) % 2 == 0)
 
@@ -796,10 +803,7 @@ class MAGIApp(App):
         # COMP (Casper) 的临界判断基于 GPU 负载和 VRAM 使用率 (与 build_casper 中的最高等级逻辑一致)
         state.comp_crit = (state.gpu_load > 60 and state.vram_used_pct > 60)
 
-        # 通过 call_from_thread 安全地回到主线程触发通知
-        self.call_from_thread(self._check_alert, state.cpu_temp, state.gpu_temp)
-
-        self.call_from_thread(self._refresh_all)
+        # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
     @work(thread=True, exclusive=True)
     def _collect_slow_tasks(self) -> None:
@@ -809,6 +813,9 @@ class MAGIApp(App):
         state.update_tcp_counts()
 
     def _refresh_all(self) -> None:
+        # 确保所有面板都已挂载
+        if not self.is_mounted:
+            return
         # 一次性刷新所有继承自 Static 的面板，减少 query_one 开销
         self.query("MAGIHeader, MelchiorPanel, BalthasarPanel, CasperPanel").refresh()
 
