@@ -415,15 +415,17 @@ def build_melchior() -> Panel:
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
     flash = state.fuse_crit and state.fuse_blink_on
     border = "bold red" if flash else "orange3"          # 加粗红色
-    box    = HEAVY if flash else None                    # 闪烁时使用粗边框线
 
-    return Panel(
-        t,
+    # 构建 Panel，仅在 flash 为 True 时传入 box=HEAVY
+    panel_kwargs = dict(
+        renderable=t,
         title="[bold orange3]MAGI-01: MELCHIOR[/]",
         border_style=border,
-        box=box,
         subtitle="AMD Ryzen 7 7800X3D",
     )
+    if flash:
+        panel_kwargs['box'] = HEAVY
+    return Panel(**panel_kwargs)
 
 
 def build_balthasar() -> Panel:
@@ -492,15 +494,16 @@ def build_balthasar() -> Panel:
     # ── 边框逻辑直接在这里决定 ──
     flash = state.pstat_crit and state.pstat_blink_on
     border = "bold red" if flash else "orange3"
-    box    = HEAVY if flash else None
 
-    return Panel(
-        t,
+    panel_kwargs = dict(
+        renderable=t,
         title="[bold orange3]MAGI-02: BALTHASAR[/]",
         border_style=border,
-        box=box,
         subtitle="SYSTEM",
     )
+    if flash:
+        panel_kwargs['box'] = HEAVY
+    return Panel(**panel_kwargs)
 
 
 def build_casper() -> Panel:
@@ -553,15 +556,16 @@ def build_casper() -> Panel:
     # ── 边框逻辑直接在这里决定 ──
     flash = state.comp_crit and state.comp_blink_on
     border = "bold red" if flash else "orange3"
-    box    = HEAVY if flash else None
 
-    return Panel(
-        t,
+    panel_kwargs = dict(
+        renderable=t,
         title="[bold orange3]MAGI-03: CASPER[/]",
         border_style=border,
-        box=box,
         subtitle="NVIDIA RTX 5070",
     )
+    if flash:
+        panel_kwargs['box'] = HEAVY
+    return Panel(**panel_kwargs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
