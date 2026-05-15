@@ -36,7 +36,7 @@ class MagiState:
         self.cpu_freq_history: list[float] = []
         self.avg_volt = 0.0
         self.current_cpu_power = 0.0
-        self.cpu_temp = "0"
+        self.cpu_temp = 0.0
         self.cpu_fan = "0"
 
         # GPU
@@ -45,14 +45,14 @@ class MagiState:
         self.vram_used_pct = 0.0
         self.gpu_volt = 0.0
         self.current_gpu_power = 0.0
-        self.gpu_temp = "0"
+        self.gpu_temp = 0.0
         self.gpu_fan = "0"
 
         # 其他
         self.used_p = 0.0
-        self.used_gb = 0.0
-        self.avail_gb = 0.0
-        self.net_dn_raw = 0.0
+        self.used_gb = "0 GB"
+        self.avail_gb = "0 GB"
+        self.net_dn_raw = "0 KB/s"
         self.max_net_dn_kbps: float = 0.0
         self.boot_time: float      = psutil.boot_time()
         self.weather: str          = "LOADING..."
@@ -246,8 +246,8 @@ def generate_bar(percent, width: int = 15, color: str = "green") -> str:
     return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/] {p:>5.1f}%"
 
 
-def get_temp_color(temp_str) -> str:
-    val = parse_n(temp_str)
+def get_temp_color(temp_val) -> str:
+    val = float(temp_val)
     if val < 45:
         return "spring_green1"
     if val < 65:
@@ -255,7 +255,7 @@ def get_temp_color(temp_str) -> str:
     return "red1"
 
 def get_status_theme(value, safe_limit, warn_limit, crit_limit) -> tuple:
-    val = parse_n(value)
+    val = float(value)
     if val >= crit_limit:
         return "bold red1",      2.5,   "CRITICAL"
     if val >= warn_limit:
@@ -265,7 +265,7 @@ def get_status_theme(value, safe_limit, warn_limit, crit_limit) -> tuple:
     return "cyan",               0,   "[reverse] STABLE [/reverse]"
 
 def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
-    val = parse_n(value_str)
+    val = float(value_str)
     # 返回格式: (颜色, 闪烁频率, 显示文本)
     if val >= crit_limit:
         return "bold red1",      2.5,  "!! OVERDRIVE !!"
@@ -377,7 +377,7 @@ def build_melchior() -> Panel:
     t.add_row("TREND",  spark)
     t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.4f} V[/]")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W[/]")
-    t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp or 'N/A'} °C[/]")
+    t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     t.add_row("FUSE",   blink_markup(status_text, color, freq))
     return Panel(
@@ -499,7 +499,7 @@ def build_casper() -> Panel:
     t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="magenta"))
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt or 'N/A'}[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W[/]")
-    t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp or 'N/A'} °C[/]")
+    t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     t.add_row("COMP",   ai)
     return Panel(
@@ -655,7 +655,8 @@ class MAGIApp(App):
         state.refresh_disk_speed() # psutil（状態更新を含むため1回だけ呼ぶ）
 
         # CPU数据采样
-        state.cpu_load = parse_n(scanner.get_val("CPU Total", "%"))
+        load_val = scanner.get_val("CPU Total", "%")
+        if load_val is not None: state.cpu_load = parse_n(load_val)
         
         freq_str = scanner.get_val("Cores (Average)", "MHz")
         if freq_str:
@@ -666,17 +667,19 @@ class MAGIApp(App):
         state.avg_volt = sum(v_list) / len(v_list) if v_list else 0.0
     
         cpu_pwr = scanner.get_val("Package", "W")
-        if cpu_pwr:
+        if cpu_pwr is not None:
             state.current_cpu_power = parse_n(cpu_pwr)
 
-        cpu_temp = parse_n(scanner.get_val("Core (Tctl/Tdie)", "°C"))
-        if cpu_temp:
-            state.cpu_temp = parse_n(cpu_temp)
+        cpu_temp_val = scanner.get_val("Core (Tctl/Tdie)", "°C")
+        if cpu_temp_val is not None:
+            state.cpu_temp = parse_n(cpu_temp_val)
 
-        state.cpu_fan = scanner.get_val("Fan #2", "RPM")
+        fan_cpu = scanner.get_val("Fan #2", "RPM")
+        if fan_cpu: state.cpu_fan = fan_cpu
 
         # GPU数据采样
-        state.gpu_load = parse_n(scanner.get_val("GPU Core", "%"))
+        gpu_load_val = scanner.get_val("GPU Core", "%")
+        if gpu_load_val is not None: state.gpu_load = parse_n(gpu_load_val)
         
         gpu_freq_str = scanner.get_val("GPU Core", "MHz")
         if gpu_freq_str:
@@ -686,26 +689,35 @@ class MAGIApp(App):
         v_total = parse_n(scanner.get_val("GPU Memory Total", "MB"))
         state.vram_used_pct = (v_used / v_total * 100) if v_total > 0 else 0.0
 
-        state.gpu_volt = scanner.get_val("GPU Core Voltage", "V")
+        gpu_volt_val = scanner.get_val("GPU Core Voltage", "V")
+        if gpu_volt_val: state.gpu_volt = gpu_volt_val
 
         gpu_p_raw = scanner.get_val("GPU Package", "W")
-        if gpu_p_raw:
+        if gpu_p_raw is not None:
             state.current_gpu_power = parse_n(gpu_p_raw)
             
-        gpu_temp = parse_n(scanner.get_val("GPU Core", "°C"))
-        if gpu_temp:
-            state.gpu_temp = parse_n(gpu_temp)
+        gpu_temp_val = scanner.get_val("GPU Core", "°C")
+        if gpu_temp_val is not None:
+            state.gpu_temp = parse_n(gpu_temp_val)
 
-        state.gpu_fan = scanner.get_val("GPU Fan", "RPM")
+        fan_gpu = scanner.get_val("GPU Fan", "RPM")
+        if fan_gpu: state.gpu_fan = fan_gpu
 
         # 其他数据
-        state.used_p   = parse_n(scanner.get_val("Total Memory Memory", "%"))
-        state.used_gb  = scanner.get_val("Total Memory Memory Used", "GB")
-        state.avail_gb = scanner.get_val("Total Memory Memory Available", "GB")
-        state.net_dn_raw = scanner.get_val("イーサネット Download Speed")
+        mem_p = scanner.get_val("Total Memory Memory", "%")
+        if mem_p is not None: state.used_p = parse_n(mem_p)
+        
+        used_gb = scanner.get_val("Total Memory Memory Used", "GB")
+        if used_gb: state.used_gb = used_gb
+        
+        avail_gb = scanner.get_val("Total Memory Memory Available", "GB")
+        if avail_gb: state.avail_gb = avail_gb
+        
+        net_val = scanner.get_val("イーサネット Download Speed")
+        if net_val: state.net_dn_raw = net_val
 
         # 通过 call_from_thread 安全地回到主线程触发通知
-        self.call_from_thread(self._check_alert, cpu_temp, gpu_temp)
+        self.call_from_thread(self._check_alert, state.cpu_temp, state.gpu_temp)
 
         self.call_from_thread(self._refresh_all)
 
