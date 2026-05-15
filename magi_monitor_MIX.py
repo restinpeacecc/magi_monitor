@@ -189,6 +189,18 @@ class MagiState:
         except Exception:
             self.ping_ms = -2.0        # 网络错误或超时
 
+    def update_project_criticality(self, fuse: bool | None = None, pstat: bool | None = None, comp: bool | None = None):
+        """
+        更新项目的临界状态。
+        使用 None 表示保持当前状态不变。
+        """
+        if fuse is not None:
+            self.fuse_is_critical = fuse
+        if pstat is not None:
+            self.pstat_is_critical = pstat
+        if comp is not None:
+            self.comp_is_critical = comp
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Scanner（OpenHardwareMonitor / LibreHardwareMonitor JSON API）
 # ══════════════════════════════════════════════════════════════════════════════
