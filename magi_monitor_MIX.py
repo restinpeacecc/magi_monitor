@@ -410,10 +410,17 @@ def build_melchior() -> Panel:
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     t.add_row("FUSE",   blink_markup(status_text, color, freq))
+    
+    # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
+    if state.fuse_crit and state.fuse_blink_on:
+        border = "red"
+    else:
+        border = "orange3"
+    
     return Panel(
         t,
         title="[bold orange3]MAGI-01: MELCHIOR[/]",
-        border_style="orange3",
+        border_style=border,
         subtitle="AMD Ryzen 7 7800X3D",
     )
 
@@ -480,10 +487,17 @@ def build_balthasar() -> Panel:
     t.add_row("TCP",    tcp_str) 
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
     t.add_row("P-STAT",  blink_markup(p_text, p_color, p_freq))
+    
+    # ── 边框逻辑直接在这里决定 ──
+    if state.pstat_crit and state.pstat_blink_on:
+        border = "red"
+    else:
+        border = "orange3"
+    
     return Panel(
         t,
         title="[bold orange3]MAGI-02: BALTHASAR[/]",
-        border_style="orange3",
+        border_style=border,
         subtitle="SYSTEM",
     )
 
@@ -534,10 +548,17 @@ def build_casper() -> Panel:
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     t.add_row("COMP",   ai)
+    
+    # ── 边框逻辑直接在这里决定 ──
+    if state.comp_crit and state.comp_blink_on:
+        border = "red"
+    else:
+        border = "orange3"
+    
     return Panel(
         t,
         title="[bold orange3]MAGI-03: CASPER[/]",
-        border_style="orange3",
+        border_style=border,
         subtitle="NVIDIA RTX 5070",
     )
 
@@ -553,44 +574,18 @@ class MAGIHeader(Static):
 
 class MelchiorPanel(Static):
     def render(self) -> Panel:
-        panel = build_melchior()
-        # 新增：根据状态闪烁边框
-        if state.fuse_crit and state.fuse_blink_on:
-            panel.border_style = "heavy red"
-            panel.border_title_style = "bold red"
-        else:
-            # 恢复默认样式
-            panel.border_style = "orange3" 
-            panel.border_title_style = "bold orange3"
-        return panel
+        return build_melchior()
 
 
 class BalthasarPanel(Static):
     def render(self) -> Panel:
-        panel = build_balthasar()
-        # 新增：根据状态闪烁边框
-        if state.pstat_crit and state.pstat_blink_on:
-            panel.border_style = "heavy red"
-            panel.border_title_style = "bold red"
-        else:
-            # 恢复默认样式
-            panel.border_style = "orange3"
-            panel.border_title_style = "bold orange3"
-        return panel
+        return build_balthasar()
 
 
 class CasperPanel(Static):
     def render(self) -> Panel:
-        panel = build_casper()
-        # 新增：根据状态闪烁边框
-        if state.comp_crit and state.comp_blink_on:
-            panel.border_style = "heavy red"
-            panel.border_title_style = "bold red"
-        else:
-            # 恢复默认样式
-            panel.border_style = "orange3"
-            panel.border_title_style = "bold orange3"
-        return panel
+        return build_casper()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SplashScreen 
@@ -707,10 +702,6 @@ class MAGIApp(App):
 
         # 新增：处理面板边框闪烁逻辑 (2.5 Hz)
         current_time = time.time()
-        # blink_state 每 0.2 秒切换一次 (True -> False -> True...)
-        # 2.5 Hz 意味着每秒 2.5 个周期，每个周期 0.4 秒。
-        # (current_time * 5) 会在 0.2 秒内增加 1。
-        # int(current_time * 5) % 2 == 0 保证了每 0.2 秒状态切换。
         blink_state = (int(current_time * 5) % 2 == 0)
 
         state.fuse_blink_on = blink_state if state.fuse_crit else False
@@ -793,7 +784,6 @@ class MAGIApp(App):
         state.fuse_crit = (state.cpu_temp >= 70) 
         
         # P-STAT (Balthasar) 的临界判断基于总功耗 (与 build_balthasar 中的逻辑一致)
-        # 基础偏置功率（主板/风扇/SSD）建议设在 40-50W 左右
         offset = 45.0 
         total_pwr = state.current_cpu_power + state.current_gpu_power + offset
         state.pstat_crit = (total_pwr >= 300) 
@@ -837,7 +827,7 @@ class MAGIApp(App):
     def _check_alert(self, cpu_temp: float, gpu_temp: float) -> None:
         old_level, new_level = state.update_alert(cpu_temp, gpu_temp)
 
-    # 只在新等级比旧等级高，或距离上次通知超过 30 秒时通知
+        # 只在新等级比旧等级高，或距离上次通知超过 30 秒时通知
         now = time.time()
         if new_level > 0 and (new_level > old_level or now - state.last_alert_time > 30):
             state.last_alert_time = now
@@ -845,6 +835,7 @@ class MAGIApp(App):
                 self.notify("[bold][red][ !! ANGEL DETECTED !! ]  MAGI SYSTEM — PATTERN BLUE CONFIRMED", severity="error", timeout=10)
             else:
                 self.notify("[bold][#FFD700]⚠️  HIGH TEMPERATURE DETECTED", severity="warning", timeout=5)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Entry point
 # ══════════════════════════════════════════════════════════════════════════════
