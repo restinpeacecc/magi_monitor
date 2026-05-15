@@ -14,6 +14,7 @@ import psutil
 import requests
 from rich.panel import Panel
 from rich.table import Table
+from rich.box import HEAVY            # ← 新增：粗边框
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -412,15 +413,15 @@ def build_melchior() -> Panel:
     t.add_row("FUSE",   blink_markup(status_text, color, freq))
     
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
-    if state.fuse_crit and state.fuse_blink_on:
-        border = "red"
-    else:
-        border = "orange3"
-    
+    flash = state.fuse_crit and state.fuse_blink_on
+    border = "bold red" if flash else "orange3"          # 加粗红色
+    box    = HEAVY if flash else None                    # 闪烁时使用粗边框线
+
     return Panel(
         t,
         title="[bold orange3]MAGI-01: MELCHIOR[/]",
         border_style=border,
+        box=box,
         subtitle="AMD Ryzen 7 7800X3D",
     )
 
@@ -489,15 +490,15 @@ def build_balthasar() -> Panel:
     t.add_row("P-STAT",  blink_markup(p_text, p_color, p_freq))
     
     # ── 边框逻辑直接在这里决定 ──
-    if state.pstat_crit and state.pstat_blink_on:
-        border = "red"
-    else:
-        border = "orange3"
-    
+    flash = state.pstat_crit and state.pstat_blink_on
+    border = "bold red" if flash else "orange3"
+    box    = HEAVY if flash else None
+
     return Panel(
         t,
         title="[bold orange3]MAGI-02: BALTHASAR[/]",
         border_style=border,
+        box=box,
         subtitle="SYSTEM",
     )
 
@@ -550,15 +551,15 @@ def build_casper() -> Panel:
     t.add_row("COMP",   ai)
     
     # ── 边框逻辑直接在这里决定 ──
-    if state.comp_crit and state.comp_blink_on:
-        border = "red"
-    else:
-        border = "orange3"
-    
+    flash = state.comp_crit and state.comp_blink_on
+    border = "bold red" if flash else "orange3"
+    box    = HEAVY if flash else None
+
     return Panel(
         t,
         title="[bold orange3]MAGI-03: CASPER[/]",
         border_style=border,
+        box=box,
         subtitle="NVIDIA RTX 5070",
     )
 
