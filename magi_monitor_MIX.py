@@ -72,6 +72,14 @@ class MagiState:
         self.disk_w: float = 0.0
         self.ping_ms: float = 0.0
         
+        # 新增：面板临界状态和闪烁状态
+        self.fuse_crit: bool = False
+        self.pstat_crit: bool = False
+        self.comp_crit: bool = False
+        self.fuse_blink_on: bool = False
+        self.pstat_blink_on: bool = False
+        self.comp_blink_on: bool = False
+        
     # ── 警报 ────────────────────────────────────────────────────────────────
 
     def update_alert(self, cpu_temp: float, gpu_temp: float):
@@ -521,17 +529,44 @@ class MAGIHeader(Static):
 
 class MelchiorPanel(Static):
     def render(self) -> Panel:
-        return build_melchior()
+        panel = build_melchior()
+        # 新增：根据状态闪烁边框
+        if state.fuse_crit and state.fuse_blink_on:
+            panel.border_style = "bold red"
+            panel.border_title_style = "bold red"
+        else:
+            # 恢复默认样式
+            panel.border_style = "orange3" 
+            panel.border_title_style = "bold orange3"
+        return panel
 
 
 class BalthasarPanel(Static):
     def render(self) -> Panel:
-        return build_balthasar()
+        panel = build_balthasar()
+        # 新增：根据状态闪烁边框
+        if state.pstat_crit and state.pstat_blink_on:
+            panel.border_style = "bold red"
+            panel.border_title_style = "bold red"
+        else:
+            # 恢复默认样式
+            panel.border_style = "orange3"
+            panel.border_title_style = "bold orange3"
+        return panel
 
 
 class CasperPanel(Static):
     def render(self) -> Panel:
-        return build_casper()
+        panel = build_casper()
+        # 新增：根据状态闪烁边框
+        if state.comp_crit and state.comp_blink_on:
+            panel.border_style = "bold red"
+            panel.border_title_style = "bold red"
+        else:
+            # 恢复默认样式
+            panel.border_style = "orange3"
+            panel.border_title_style = "bold orange3"
+        return panel
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SplashScreen 
@@ -643,8 +678,20 @@ class MAGIApp(App):
     # ── Update cycle ──────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
-        """イベントループから呼ばれる軽量ディスパッチャ。実処理はワーカーへ。"""
+        """事件循环中频繁调用的轻量级调度器。实际处理在worker线程中。"""
         self._collect()
+
+        # 新增：处理面板边框闪烁逻辑 (2.5 Hz)
+        current_time = time.time()
+        # blink_state 每 0.2 秒切换一次 (True -> False -> True...)
+        # 2.5 Hz 意味着每秒 2.5 个周期，每个周期 0.4 秒。
+        # (current_time * 5) 会在 0.2 秒内增加 1。
+        # int(current_time * 5) % 2 == 0 保证了每 0.2 秒状态切换。
+        blink_state = (int(current_time * 5) % 2 == 0)
+
+        state.fuse_blink_on = blink_state if state.fuse_crit else False
+        state.pstat_blink_on = blink_state if state.pstat_crit else False
+        state.comp_blink_on = blink_state if state.comp_crit else False
 
     @work(thread=True, exclusive=True)
     def _collect(self) -> None:
@@ -716,6 +763,19 @@ class MAGIApp(App):
         
         net_val = scanner.get_val("イーサネット Download Speed")
         if net_val: state.net_dn_raw = net_val
+
+        # 新增：更新面板临界状态标志
+        # FUSE (Melchior) 的临界判断基于 CPU 温度
+        state.fuse_crit = (state.cpu_temp >= 70) 
+        
+        # P-STAT (Balthasar) 的临界判断基于总功耗 (与 build_balthasar 中的逻辑一致)
+        # 基础偏置功率（主板/风扇/SSD）建议设在 40-50W 左右
+        offset = 45.0 
+        total_pwr = state.current_cpu_power + state.current_gpu_power + offset
+        state.pstat_crit = (total_pwr >= 300) 
+        
+        # COMP (Casper) 的临界判断基于 GPU 负载和 VRAM 使用率 (与 build_casper 中的最高等级逻辑一致)
+        state.comp_crit = (state.gpu_load > 60 and state.vram_used_pct > 60)
 
         # 通过 call_from_thread 安全地回到主线程触发通知
         self.call_from_thread(self._check_alert, state.cpu_temp, state.gpu_temp)
