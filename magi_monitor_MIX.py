@@ -71,10 +71,6 @@ class MagiState:
         self.disk_r: float = 0.0
         self.disk_w: float = 0.0
         self.ping_ms: float = 0.0
-
-        self.fuse_is_critical: bool = False    # FUSE项目是否临界，决定Melchior面板是否闪烁
-        self.pstat_is_critical: bool = False   # P-STAT项目是否临界，决定Balthasar面板是否闪烁
-        self.comp_is_critical: bool = False    # COMP项目是否临界，决定Casper面板是否闪烁
         
     # ── 警报 ────────────────────────────────────────────────────────────────
 
@@ -188,18 +184,6 @@ class MagiState:
                 self.ping_ms = -1.0   # 解析失败
         except Exception:
             self.ping_ms = -2.0        # 网络错误或超时
-
-    def update_project_criticality(self, fuse: bool | None = None, pstat: bool | None = None, comp: bool | None = None):
-        """
-        更新项目的临界状态。
-        使用 None 表示保持当前状态不变。
-        """
-        if fuse is not None:
-            self.fuse_is_critical = fuse
-        if pstat is not None:
-            self.pstat_is_critical = pstat
-        if comp is not None:
-            self.comp_is_critical = comp
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Scanner（OpenHardwareMonitor / LibreHardwareMonitor JSON API）
@@ -476,10 +460,10 @@ def build_balthasar() -> Panel:
 
 def build_casper() -> Panel:
     
-    if state.gpu_load > 50 and state.vram_used_pct > 50:                        # 最高优先级：满负荷
+    if state.gpu_load > 60 and state.vram_used_pct > 60:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
-        ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] AI-ACTIVE [/]"
-    elif state.gpu_load > 20 and state.vram_used_pct > 20:                      # 中负荷
+        ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
+    elif state.gpu_load > 30 and state.vram_used_pct > 30:                      # 中负荷
         on = (time.time() * 2) % 2 < 1                  # 1 Hz
         ai = "[bold gold1][reverse] AI-ACTIVE [/reverse][/]" if on else "[bold red1] AI-ACTIVE [/]"
     elif state.gpu_load > 10:                                     # 低负荷（仅 GPU 核心有活动）
@@ -608,12 +592,6 @@ class SplashScreen(Screen):
 
 class MAGIApp(App):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._panel_blink_state_fuse = False
-        self._panel_blink_state_pstat = False
-        self._panel_blink_state_comp = False
-
     CSS = """
     Screen {
         background: transparent;
@@ -623,12 +601,6 @@ class MAGIApp(App):
         height: 3;
         dock: top;
         background: transparent;
-    }
-
-    /* 新增：闪烁边框的CSS样式 */
-    .blink-border {
-        border: dashed red; /* 例如：红色虚线边框 */
-        /* 您可以根据需要调整颜色 */
     }
 
     #panels {
@@ -673,7 +645,6 @@ class MAGIApp(App):
     def _tick(self) -> None:
         """イベントループから呼ばれる軽量ディスパッチャ。実処理はワーカーへ。"""
         self._collect()
-        self._update_panel_blink_state() # 刷新面板的闪烁状态
 
     @work(thread=True, exclusive=True)
     def _collect(self) -> None:
@@ -746,24 +717,6 @@ class MAGIApp(App):
         net_val = scanner.get_val("イーサネット Download Speed")
         if net_val: state.net_dn_raw = net_val
 
-        # CPU FUSE 临界状态判断
-        fuse_critical_now = (state.cpu_temp >= 70) # 根据 get_status_theme 的 crit_limit = 70
-
-        # 整机估算功耗（为 P-STAT 临界状态判断）
-        offset = 45.0
-        total_pwr = state.current_cpu_power + state.current_gpu_power + offset
-        pstat_critical_now = (total_pwr >= 300) # 根据 get_power_theme 的 crit_limit = 300
-
-        # GPU COMP 临界状态判断
-        comp_critical_now = (state.gpu_load > 50 and state.vram_used_pct > 50) # 根据 build_casper 的最高优先级逻辑
-
-        # 更新 MagiState 中的临界状态
-        state.update_project_criticality(
-            fuse=fuse_critical_now,
-            pstat=pstat_critical_now,
-            comp=comp_critical_now
-        )
-
         # 通过 call_from_thread 安全地回到主线程触发通知
         self.call_from_thread(self._check_alert, state.cpu_temp, state.gpu_temp)
 
@@ -779,27 +732,6 @@ class MAGIApp(App):
     def _refresh_all(self) -> None:
         # 一次性刷新所有继承自 Static 的面板，减少 query_one 开销
         self.query("MAGIHeader, MelchiorPanel, BalthasarPanel, CasperPanel").refresh()
-
-    def _update_panel_blink_state(self) -> None:
-        """根据 MagiState 的临界状态更新面板的闪烁CSS类。"""
-        # Melchior面板 (FUSE)
-        melchior_panel = self.query_one("#melchior_panel")
-        if state.fuse_is_critical != self._panel_blink_state_fuse:
-            self._panel_blink_state_fuse = state.fuse_is_critical
-            melchior_panel.set_class(state.fuse_is_critical, "blink-border")
-
-        # Balthasar面板 (P-STAT)
-        balthasar_panel = self.query_one("#balthasar_panel")
-        if state.pstat_is_critical != self._panel_blink_state_pstat:
-            self._panel_blink_state_pstat = state.pstat_is_critical
-            balthasar_panel.set_class(state.pstat_is_critical, "blink-border")
-
-        # Casper面板 (COMP)
-        casper_panel = self.query_one("#casper_panel")
-        if state.comp_is_critical != self._panel_blink_state_comp:
-            self._panel_blink_state_comp = state.comp_is_critical
-            casper_panel.set_class(state.comp_is_critical, "blink-border")
-
 
     # ── Key actions ───────────────────────────────────────────────────────────
 
