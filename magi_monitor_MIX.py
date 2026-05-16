@@ -293,16 +293,16 @@ def get_status_theme(value, safe_limit, warn_limit, crit_limit) -> tuple:
     if val >= warn_limit:
         return "bold gold1",     1,   "WARNING"
     if val >= safe_limit:
-        return "bold green",  0.5, "CAUTION"
+        return "bold green",     0.5, "CAUTION"
     return "cyan",               0,   "[reverse] STABLE [/reverse]"
 
 def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     val = float(value_str)
     # 返回格式: (颜色, 闪烁频率, 显示文本)
     if val >= crit_limit:
-        return "bold red1",      2.5,  "!! OVERDRIVE !!"
+        return "bold red1",      2.5,  "OVERDRIVE"
     if val >= warn_limit:
-        return "bold gold1",     1,  "PC-HIGH"
+        return "bold gold1",     1,  "HIGH-LOAD"
     if val >= safe_limit:
         return "bold green",     0.5,  "ACTIVE"
     return "cyan",               0,    "[reverse] ECO [/reverse]"
@@ -518,7 +518,7 @@ def build_casper() -> Panel:
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
     elif state.gpu_load >= 30 and state.vram_used_pct >= 30:                      # 中负荷
         on = (time.time() * 2) % 2 < 1                  # 1 Hz
-        ai = "[bold gold1][reverse] AI-ACTIVE [/reverse][/]" if on else "[bold gold1] AI-ACTIVE [/]"
+        ai = "[bold gold1][reverse] ENGAGED [/reverse][/]" if on else "[bold gold1] ENGAGED [/]"
     elif state.gpu_load >= 10:                                     # 低负荷（仅 GPU 核心有活动）
         on = (time.time() * 1) % 2 < 1                  # 0.5 Hz
         ai = "[bold green][reverse] INIT [/reverse][/]" if on else "[bold green] INIT [/]"
@@ -801,7 +801,7 @@ class MAGIApp(App):
         state.pstat_crit = (total_pwr >= 300) 
         
         # COMP (Casper) 的临界判断基于 GPU 负载和 VRAM 使用率 (与 build_casper 中的最高等级逻辑一致)
-        state.comp_crit = (state.gpu_load >= 60 and state.vram_used_pct >= 60)
+        state.comp_crit = (state.gpu_load >= 60 and state.vram_used_pct >= 50)
 
         # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
