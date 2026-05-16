@@ -123,9 +123,9 @@ class MagiState:
     def update_alert(self, cpu_temp: float, gpu_temp: float):
         """根据温度确定警报等级，返回 (原等级, 新等级)"""
         old_level = self.alert_level
-        if cpu_temp >= 75 and gpu_temp >= 75:     # 自定义危险阈值
+        if cpu_temp >= 80 and gpu_temp >= 80:     # 自定义危险阈值（2级警报）
             new_level = 2
-        elif cpu_temp >= 70 and gpu_temp >= 70:
+        elif cpu_temp >= 75 and gpu_temp >= 75:   # 1级警报
             new_level = 1
         else:
             new_level = 0
