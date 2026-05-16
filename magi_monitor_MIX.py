@@ -22,6 +22,25 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Static, Label
 from textual.screen import Screen
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Constants
+# ══════════════════════════════════════════════════════════════════════════════
+
+BASE_POWER_OFFSET = 45.0            # 主板/风扇/SSD 等基础功耗 (W)
+
+CPU_TEMP_CAUTION    = 50           # °C
+CPU_TEMP_WARNING    = 60
+CPU_TEMP_CRITICAL   = 70
+
+POWER_SAFE  = 100                  # W
+POWER_WARN  = 180
+POWER_CRIT  = 300
+
+GPU_LOAD_HIGH   = 60               # %
+VRAM_USED_HIGH  = 50               # %
+
+CPU_FREQ_MIN = 3000.0              # MHz（Braille 曲线 Y 轴下限）
+CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  State
@@ -347,7 +366,22 @@ def generate_braille_trend(values: list[float], width: int = 22,
         color = high_color if ratio > 0.7 else (low_color if ratio < 0.3 else mid_color)
         segments.append(f"[{color}]{chr(code)}[/]")
     return "".join(segments)
-          
+
+def get_trend_arrow(values: list[float], threshold: float = 20) -> str:
+    """根据最近25个点与前25个点的平均值比较，返回方向符号"""
+    if len(values) < 25:
+        return "[yellow]►[/]"
+    recent = values[-25:]
+    older  = values[-50:-25]
+    avg_recent = sum(recent) / len(recent)
+    avg_older  = sum(older) / len(older) if older else avg_recent
+    if avg_recent > avg_older + threshold:
+        return "[green]▲[/]"
+    elif avg_recent < avg_older - threshold:
+        return "[red]▼[/]"
+    else:
+        return "[yellow]►[/]"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Panel builders（Rich レンダラブルを返す）
 # ══════════════════════════════════════════════════════════════════════════════
@@ -371,7 +405,7 @@ def build_melchior() -> Panel:
     spark = generate_braille_trend(
         cpu_snapshot, 
         width=22, 
-        y_range=(3000.0, 5000.0),
+        y_range=(CPU_FREQ_MIN, CPU_FREQ_MAX),
         low_color="cyan", 
         mid_color="yellow", 
         high_color="red1"
@@ -382,17 +416,7 @@ def build_melchior() -> Panel:
         f_min = min(history)
         f_max = max(history)
         f_now = history[-1]
-        # 方向判断（最近 5 秒 vs 之前 5 秒）
-        recent = history[-25:] if len(history) >= 25 else history
-        older  = history[-50:-25] if len(history) >= 50 else history[:len(recent)]
-        avg_recent = sum(recent) / len(recent)
-        avg_older  = sum(older) / len(older) if older else avg_recent
-        if avg_recent > avg_older + 20:
-            arrow = "[green]▲[/]"
-        elif avg_recent < avg_older - 20:
-            arrow = "[red]▼[/]"
-        else:
-            arrow = "[yellow]►[/]"
+        arrow = get_trend_arrow(history)
         # 组装文本
         freq_str = (
             f"[dim]{f_min:.0f}[/] "
@@ -402,7 +426,9 @@ def build_melchior() -> Panel:
     else:
         freq_str = "[dim]collecting...[/]"
         
-    color, freq, status_text = get_status_theme(state.cpu_temp, 50, 60, 70)
+    color, freq, status_text = get_status_theme(
+        state.cpu_temp, CPU_TEMP_CAUTION, CPU_TEMP_WARNING, CPU_TEMP_CRITICAL
+    )
 
     t = Table.grid(padding=0)
     t.add_column(width=10)
@@ -475,13 +501,11 @@ def build_balthasar() -> Panel:
 
     tcp_str = f"[#7CFC00]EST:{state.tcp_established}[/] [dim]|[/] [cadet_blue]TW:{state.tcp_timewait}[/]"
 
-    # 计算整机估算功耗
-    # 基础偏置功率（主板/风扇/SSD）建议设在 40-50W 左右
-    offset = 45.0 
-    total_pwr = state.current_cpu_power + state.current_gpu_power + offset
+    # 整机估算功耗
+    total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
     
     # 使用定制的功耗状态灯
-    p_color, p_freq, p_text = get_power_theme(total_pwr, 100, 180, 300)
+    p_color, p_freq, p_text = get_power_theme(total_pwr, POWER_SAFE, POWER_WARN, POWER_CRIT)
 
     t = Table.grid(padding=0)
     t.add_column(width=10)
@@ -513,7 +537,7 @@ def build_casper() -> Panel:
     
     gpu_snapshot = state.get_gpu_freq_snapshot(600)
 
-    if state.gpu_load >= 60 and state.vram_used_pct >= 50:                        # 最高优先级：满负荷
+    if state.gpu_load >= GPU_LOAD_HIGH and state.vram_used_pct >= VRAM_USED_HIGH:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
     elif state.gpu_load >= 30 and state.vram_used_pct >= 30:                      # 中负荷
@@ -530,17 +554,7 @@ def build_casper() -> Panel:
         f_min = min(history)
         f_max = max(history)
         f_now = history[-1]
-        # 方向判断（最近 5 秒 vs 之前 5 秒）
-        recent = history[-25:] if len(history) >= 25 else history
-        older  = history[-50:-25] if len(history) >= 50 else []
-        avg_recent = sum(recent) / len(recent)
-        avg_older  = sum(older) / len(older) if older else avg_recent
-        if avg_recent > avg_older + 20:
-            arrow = "[green]▲[/]"
-        elif avg_recent < avg_older - 20:
-            arrow = "[red]▼[/]"
-        else:
-            arrow = "[yellow]►[/]"
+        arrow = get_trend_arrow(history)
         freq_display = f"[dim]{f_min:.0f}[/] [bold gold1]{f_now:.0f} MHz {arrow}[/] [dim]{f_max:.0f}[/]"
     else:
         freq_display = f"[bold gold1]{'N/A'}[/]"   # 数据不足时回退原始显示
@@ -727,7 +741,6 @@ class MAGIApp(App):
         exclusive=True により前回のワーカーが終わっていなければ新規呼び出しはスキップ。
         """
         scanner.update()           # HTTP (OHM JSON API)
-        state.refresh_disk_speed() # psutil（状態更新を含むため1回だけ呼ぶ）
 
         # CPU数据采样
         load_val = scanner.get_val("CPU Total", "%")
@@ -791,17 +804,17 @@ class MAGIApp(App):
         net_val = scanner.get_val("イーサネット Download Speed")
         if net_val: state.net_dn_raw = net_val
 
+        # 磁盘速度放在传感器采样后，减小时间偏差
+        state.refresh_disk_speed()
+
         # 新增：更新面板临界状态标志
         # FUSE (Melchior) 的临界判断基于 CPU 温度
-        state.fuse_crit = (state.cpu_temp >= 70) 
-        
+        state.fuse_crit = (state.cpu_temp >= CPU_TEMP_CRITICAL)
         # P-STAT (Balthasar) 的临界判断基于总功耗 (与 build_balthasar 中的逻辑一致)
-        offset = 45.0 
-        total_pwr = state.current_cpu_power + state.current_gpu_power + offset
-        state.pstat_crit = (total_pwr >= 300) 
-        
+        total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
+        state.pstat_crit = (total_pwr >= POWER_CRIT)
         # COMP (Casper) 的临界判断基于 GPU 负载和 VRAM 使用率 (与 build_casper 中的最高等级逻辑一致)
-        state.comp_crit = (state.gpu_load >= 60 and state.vram_used_pct >= 50)
+        state.comp_crit = (state.gpu_load >= GPU_LOAD_HIGH and state.vram_used_pct >= VRAM_USED_HIGH)
 
         # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
