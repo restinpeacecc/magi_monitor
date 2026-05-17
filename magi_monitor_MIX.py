@@ -30,7 +30,7 @@ BASE_POWER_OFFSET = 45.0            # 主板/风扇/SSD 等基础功耗 (W)
 
 CPU_TEMP_CAUTION    = 50           # °C
 CPU_TEMP_WARNING    = 60
-CPU_TEMP_CRITICAL   = 75           # °C（保持一致，与1级警报阈值相同）
+CPU_TEMP_CRITICAL   = 70           # °C（保持一致，与1级警报阈值相同）
 
 POWER_SAFE  = 100                  # W
 POWER_WARN  = 180
@@ -301,7 +301,7 @@ def get_temp_color(temp_val) -> str:
     val = float(temp_val)
     if val < 45:
         return "spring_green1"
-    if val < 65:
+    if val < 68:
         return "yellow"
     return "red1"
 
