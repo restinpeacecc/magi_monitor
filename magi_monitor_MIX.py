@@ -48,8 +48,8 @@ CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
 class MagiState:
     
-    CPU_FREQ_HISTORY_MAX = 600
-    GPU_FREQ_HISTORY_MAX = 600
+    CPU_FREQ_HISTORY_MAX = 1500   # 覆盖约 5 分钟（5 点/秒）
+    GPU_FREQ_HISTORY_MAX = 1500   # 与 CPU 统一
     
     def __init__(self):
         # CPU
@@ -400,7 +400,7 @@ def build_header() -> Panel:
 
 def build_melchior() -> Panel:
 
-    cpu_snapshot = state.get_cpu_freq_snapshot(600)
+    cpu_snapshot = state.get_cpu_freq_snapshot(CPU_FREQ_HISTORY_MAX)
 
     spark = generate_braille_trend(
         cpu_snapshot, 
@@ -535,7 +535,7 @@ def build_balthasar() -> Panel:
 
 def build_casper() -> Panel:
     
-    gpu_snapshot = state.get_gpu_freq_snapshot(600)
+    gpu_snapshot = state.get_gpu_freq_snapshot(GPU_FREQ_HISTORY_MAX)
 
     if state.gpu_load >= GPU_LOAD_HIGH and state.vram_used_pct >= VRAM_USED_HIGH:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
