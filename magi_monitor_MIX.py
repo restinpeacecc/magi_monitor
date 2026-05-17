@@ -400,7 +400,7 @@ def build_header() -> Panel:
 
 def build_melchior() -> Panel:
 
-    cpu_snapshot = state.get_cpu_freq_snapshot(CPU_FREQ_HISTORY_MAX)
+    cpu_snapshot = state.get_cpu_freq_snapshot(state.CPU_FREQ_HISTORY_MAX)
 
     spark = generate_braille_trend(
         cpu_snapshot, 
@@ -535,7 +535,7 @@ def build_balthasar() -> Panel:
 
 def build_casper() -> Panel:
     
-    gpu_snapshot = state.get_gpu_freq_snapshot(GPU_FREQ_HISTORY_MAX)
+    gpu_snapshot = state.get_gpu_freq_snapshot(state.GPU_FREQ_HISTORY_MAX)
 
     if state.gpu_load >= GPU_LOAD_HIGH and state.vram_used_pct >= VRAM_USED_HIGH:                        # 最高优先级：满负荷
         on = (time.time() * 5) % 2 < 1                  # 2.5 Hz
