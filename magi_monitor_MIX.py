@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MAGI SYSTEM Monitor — Textual Edition
-rich.live + msvcrt → Textual (非同期イベントループ・スレッドワーカー・CSS レイアウト)
+MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CSS 布局）
 """
 
 import re
@@ -23,7 +23,7 @@ from textual.widgets import Footer, Static, Label
 from textual.screen import Screen
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Constants
+#  常量
 # ══════════════════════════════════════════════════════════════════════════════
 
 BASE_POWER_OFFSET = 45.0            # 主板/风扇/SSD 等基础功耗 (W)
@@ -42,8 +42,16 @@ VRAM_USED_HIGH  = 50               # %
 CPU_FREQ_MIN = 3000.0              # MHz（Braille 曲线 Y 轴下限）
 CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
+# 面板标题/副标题常量
+PANEL_MELCHIOR_TITLE = "[bold orange3]MAGI-01: MELCHIOR[/]"
+PANEL_MELCHIOR_SUB = "AMD Ryzen 7 7800X3D"
+PANEL_BALTHASAR_TITLE = "[bold orange3]MAGI-02: BALTHASAR[/]"
+PANEL_BALTHASAR_SUB = "SYSTEM"
+PANEL_CASPER_TITLE = "[bold orange3]MAGI-03: CASPER[/]"
+PANEL_CASPER_SUB = "NVIDIA RTX 5070"
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  State
+#  状态
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MagiState:
@@ -86,7 +94,7 @@ class MagiState:
         self.tcp_timewait    = 0
         self._last_tcp_update = 0.0
 
-        # ディスク速度は per-cycle でキャッシュ（render() から複数回呼ばれないよう分離）
+        # 磁盘速度按周期缓存（与 render() 分离，避免多次调用）
         self._last_disk_io = psutil.disk_io_counters()
         self._last_time: float = time.time()
         self.disk_r: float = 0.0
@@ -132,7 +140,7 @@ class MagiState:
         self.alert_level = new_level
         return old_level, new_level
     
-    # ── Uptime ────────────────────────────────────────────────────────────────
+    # ── 运行时间 ────────────────────────────────────────────────────────────────
 
     def get_uptime_str(self) -> str:
         sec = time.time() - self.boot_time
@@ -194,7 +202,7 @@ class MagiState:
     def get_max_net_dn_kbps(self) -> float:
         return self.max_net_dn_kbps
     
-    # ── Disk speed（ワーカースレッドから1回だけ呼ぶ）───────────────────────
+    # ── 磁盘速度（仅由工作线程调用一次）────────────────────────
 
     def refresh_disk_speed(self):
         now_io   = psutil.disk_io_counters()
@@ -209,7 +217,7 @@ class MagiState:
         self._last_disk_io = now_io
         self._last_time    = now_time
 
-    # ── Weather（30分ごと）──────────────────────────────────────────────────
+    # ── 天气（每30分钟更新一次）──────────────────────────────────────────────────
 
     def update_weather(self):
         if time.time() - self.last_weather_update > 1800:
@@ -243,35 +251,38 @@ class MagiState:
 class MAGIScanner:
     def __init__(self):
         self.url = "http://localhost:8085/data.json"
-        self.sensors: list[dict] = []
+        # 预计算的小写名称缓存，避免每次 get_val 重复调用 .lower()
+        self._cache: list[tuple[str, str]] = []
 
     def update(self):
         try:
             raw = requests.get(self.url, timeout=0.3).json()
-            self.sensors = []
+            self._cache = []
             self._walk(raw)
         except Exception:
-            self.sensors = []
+            self._cache = []
 
     def _walk(self, node, hw: str = ""):
         if "HardwareId" in node:
             hw = node.get("Text", "")
         if node.get("Value"):
-            self.sensors.append({"name": f"{hw} {node.get('Text', '')}", "val": node.get("Value", "")})
+            name = f"{hw} {node.get('Text', '')}"
+            val = str(node.get("Value", ""))
+            self._cache.append((name.lower(), val))
         for child in node.get("Children", []):
             self._walk(child, hw)
 
     def get_val(self, name_target: str, unit_target: str | None = None) -> str | None:
         nl = name_target.lower()
-        for s in self.sensors:
-            if nl in s["name"].lower():
-                if unit_target is None or unit_target.lower() in s["val"].lower():
-                    return s["val"]
+        for name_lower, val in self._cache:
+            if nl in name_lower:
+                if unit_target is None or unit_target.lower() in val.lower():
+                    return val
         return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Module-level singletons
+#  模块级单例
 # ══════════════════════════════════════════════════════════════════════════════
 
 state   = MagiState()
@@ -279,10 +290,10 @@ scanner = MAGIScanner()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Helpers
+#  辅助函数
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_n(v_str) -> float:
+def parse_n(v_str: str | None) -> float:
     if not v_str:
         return 0.0
     try:
@@ -327,7 +338,7 @@ def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     return "cyan",               0,    "[reverse] ECO [/reverse]"
 
 def blink_markup(text: str, color: str, freq: float) -> str:
-    """time.time() ベースの点滅マークアップ（render() 呼び出しのたびに評価される）"""
+    """基于 time.time() 的点灭标记（每次 render() 调用时重新计算）"""
     if freq <= 0:
         return f"[{color}] {text} [/]"
     on = (time.time() * freq * 2) % 2 < 1
@@ -345,7 +356,13 @@ def generate_braille_trend(values: list[float], width: int = 22,
     else:
         data = values[-total_pts:]
         
-    vmin, vmax = y_range if y_range else (min(data), max(data))
+    if y_range:
+        vmin, vmax = y_range
+    else:
+        vmin = vmax = data[0]
+        for v in data[1:]:
+            if v < vmin: vmin = v
+            elif v > vmax: vmax = v
     if abs(vmax - vmin) < 1e-6:
         vmin, vmax = vmax - 1, vmax + 1
         
@@ -383,7 +400,7 @@ def get_trend_arrow(values: list[float], threshold: float = 20) -> str:
         return "[yellow]►[/]"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Panel builders（Rich レンダラブルを返す）
+#  面板构建器（返回 Rich 可渲染对象）
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_header() -> Panel:
@@ -448,9 +465,9 @@ def build_melchior() -> Panel:
     # 构建 Panel，仅在 flash 为 True 时传入 box=HEAVY
     panel_kwargs = dict(
         renderable=t,
-        title="[bold orange3]MAGI-01: MELCHIOR[/]",
+        title=PANEL_MELCHIOR_TITLE,
         border_style=border,
-        subtitle="AMD Ryzen 7 7800X3D",
+        subtitle=PANEL_MELCHIOR_SUB,
     )
     if flash:
         panel_kwargs['box'] = HEAVY
@@ -473,7 +490,6 @@ def build_balthasar() -> Panel:
         else:
             dn_kbps = num
 
-    state.add_net_dn(dn_kbps)          # 记录进历史
     # 当前速度显示（保持原始字符串）
     net_cur = net_dn_raw
 
@@ -524,9 +540,9 @@ def build_balthasar() -> Panel:
 
     panel_kwargs = dict(
         renderable=t,
-        title="[bold orange3]MAGI-02: BALTHASAR[/]",
+        title=PANEL_BALTHASAR_TITLE,
         border_style=border,
-        subtitle="SYSTEM",
+        subtitle=PANEL_BALTHASAR_SUB,
     )
     if flash:
         panel_kwargs['box'] = HEAVY
@@ -576,9 +592,9 @@ def build_casper() -> Panel:
 
     panel_kwargs = dict(
         renderable=t,
-        title="[bold orange3]MAGI-03: CASPER[/]",
+        title=PANEL_CASPER_TITLE,
         border_style=border,
-        subtitle="NVIDIA RTX 5070",
+        subtitle=PANEL_CASPER_SUB,
     )
     if flash:
         panel_kwargs['box'] = HEAVY
@@ -586,7 +602,7 @@ def build_casper() -> Panel:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Textual Widgets（render() が Rich Panel を返す）
+#  Textual 组件（render() 返回 Rich Panel）
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MAGIHeader(Static):
@@ -610,7 +626,7 @@ class CasperPanel(Static):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SplashScreen 
+#  启动画面
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SplashScreen(Screen):
@@ -663,7 +679,7 @@ class SplashScreen(Screen):
         self.app.pop_screen()
         
 # ══════════════════════════════════════════════════════════════════════════════
-#  App
+#  主应用
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MAGIApp(App):
@@ -713,10 +729,17 @@ class MAGIApp(App):
     def on_mount(self) -> None:
         # 先显示启动动画屏幕
         self.push_screen(SplashScreen())
+        # 缓存面板引用，避免 _refresh_all 中重复 query
+        self._refresh_widgets = [
+            self.query_one(MAGIHeader),
+            self.query_one(MelchiorPanel),
+            self.query_one(BalthasarPanel),
+            self.query_one(CasperPanel),
+        ]
         self.set_interval(0.2, self._tick)     # 高频：传感器
         self.set_interval(5.0, self._collect_slow_tasks) # 低频：Ping/TCP
 
-    # ── Update cycle ──────────────────────────────────────────────────────────
+    # ── 更新循环 ──────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
         """事件循环中频繁调用的轻量级调度器。实际处理在worker线程中。"""
@@ -736,9 +759,8 @@ class MAGIApp(App):
 
     @work(thread=True, exclusive=True)
     def _collect(self) -> None:
-        """
-        ブロッキング I/O をバックグラウンドスレッドで実行。
-        exclusive=True により前回のワーカーが終わっていなければ新規呼び出しはスキップ。
+        """在后台线程中执行阻塞 I/O 操作。
+        exclusive=True 确保上次工作器未完成时跳过新调用。
         """
         scanner.update()           # HTTP (OHM JSON API)
 
@@ -804,6 +826,20 @@ class MAGIApp(App):
         net_val = scanner.get_val("イーサネット Download Speed")
         if net_val: state.net_dn_raw = net_val
 
+        # 解析下载速度并记录最大值（从 render 中移至此，避免重复调用）
+        dn_match = re.search(r"([0-9,.]+)\s*(KB|MB|GB)/s?", state.net_dn_raw, re.IGNORECASE)
+        dn_kbps = 0.0
+        if dn_match:
+            num = float(dn_match.group(1).replace(",", ""))
+            unit = dn_match.group(2).upper()
+            if unit == "GB":
+                dn_kbps = num * 1024 * 1024
+            elif unit == "MB":
+                dn_kbps = num * 1024
+            else:
+                dn_kbps = num
+        state.add_net_dn(dn_kbps)
+
         # 磁盘速度放在传感器采样后，减小时间偏差
         state.refresh_disk_speed()
 
@@ -822,20 +858,18 @@ class MAGIApp(App):
     def _collect_slow_tasks(self) -> None:
         """独立运行的慢速任务，不影响传感器刷新率"""
         state.update_ping()
-        state.update_weather()  # HTTP (wttr.in) ※30分ごと
+        state.update_weather()  # HTTP (wttr.in) 每30分钟更新
         state.update_tcp_counts()
 
     def _refresh_all(self) -> None:
-        # 确保所有面板都已挂载
-        if not self.is_mounted:
-            return
-        # 一次性刷新所有继承自 Static 的面板，减少 query_one 开销
-        self.query("MAGIHeader, MelchiorPanel, BalthasarPanel, CasperPanel").refresh()
+        # 使用缓存的面板引用，避免每次刷新都执行 CSS 选择器查询
+        for widget in self._refresh_widgets:
+            widget.refresh()
 
-    # ── Key actions ───────────────────────────────────────────────────────────
+    # ── 快捷键操作 ───────────────────────────────────────────────────────────
 
     def action_launch_pstop(self) -> None:
-        """M キー: Textual を一時停止して pstop を起動し、終了後に再開する。"""
+        """M 键：暂停 Textual 并启动 pstop，退出后恢复。"""
         with self.suspend():
             subprocess.run(["pstop"])
 
@@ -847,7 +881,7 @@ class MAGIApp(App):
         with self.suspend():
             subprocess.run(["psnet"])
             
-    # ── alert ───────────────────────────────────────────────────────────
+    # ── 警报 ───────────────────────────────────────────────────────────
         
     def _check_alert(self, cpu_temp: float, gpu_temp: float) -> None:
         old_level, new_level = state.update_alert(cpu_temp, gpu_temp)
@@ -862,7 +896,7 @@ class MAGIApp(App):
                 self.notify("[bold][#FFD700]⚠️  HIGH TEMPERATURE DETECTED", severity="warning", timeout=5)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Entry point
+#  入口点
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
