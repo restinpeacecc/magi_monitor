@@ -32,6 +32,7 @@ python magi_monitor_MIX.py
 | `m` | Launch `pstop` (via `self.suspend()`) |
 | `n` | Launch `psnet` |
 | `t` | Launch `yazi f:\` |
+| `x` | Launch `opencode` |
 
 ## Conventions
 
