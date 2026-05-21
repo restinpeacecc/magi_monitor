@@ -884,7 +884,7 @@ class MAGIApp(App):
 
     def action_launch_opencode(self) -> None:
         with self.suspend():
-            subprocess.run(["opencode"])
+            subprocess.run(["opencode", "D:\\tools"])
 
     # ── 警报 ───────────────────────────────────────────────────────────
         
