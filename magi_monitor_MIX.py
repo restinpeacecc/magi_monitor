@@ -716,6 +716,7 @@ class MAGIApp(App):
         Binding("m", "launch_pstop", "pstop", show=True),
         Binding("n", "launch_psnet", "psnet", show=True),
         Binding("t", "launch_yazi", "yazi", show=True),
+        Binding("x", "launch_opencode", "opencode", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -880,7 +881,11 @@ class MAGIApp(App):
     def action_launch_psnet(self) -> None:
         with self.suspend():
             subprocess.run(["psnet"])
-            
+
+    def action_launch_opencode(self) -> None:
+        with self.suspend():
+            subprocess.run(["opencode"])
+
     # ── 警报 ───────────────────────────────────────────────────────────
         
     def _check_alert(self, cpu_temp: float, gpu_temp: float) -> None:
