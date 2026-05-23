@@ -796,7 +796,7 @@ class MAGIApp(App):
         if gpu_freq_str:
             state.add_gpu_freq(parse_n(gpu_freq_str))
 
-        v_used = parse_n(scanner.get_val("D3D Dedicated Memory Used", "MB"))
+        v_used = parse_n(scanner.get_val("GPU Memory Used", "MB"))
         v_total = parse_n(scanner.get_val("GPU Memory Total", "MB"))
         state.vram_used_pct = (v_used / v_total * 100) if v_total > 0 else 0.0
 
