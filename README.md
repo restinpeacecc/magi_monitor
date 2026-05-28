@@ -127,7 +127,7 @@ POWER_CRIT  = 300
 - PKG-W: 封装功耗
 - TEMP: 温度（颜色编码）
 - FAN: 风扇转速
-- QUANT: Ollama 模型信息（模型名+量化等级 / STBY / OFFLINE）
+- MODEL: Ollama 模型信息（模型名+量化等级 / STBY / OFFLINE）
 - FUSE: 状态指示器（ECO/ACTIVE/HIGH-LOAD/OVERDRIVE）
 
 ### BALTHASAR (SYSTEM)
