@@ -44,6 +44,13 @@ python magi_monitor_MIX.py
 
 - **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls panel border flash; `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications. These serve different UI purposes and should not be unified.
 
+## AI State Display
+
+- **MELCHIOR** `QUANT`: three-state — `[bold #BA55D3]family quant[/]` (model loaded), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
+- **BALTHASAR** `REQ`: three-state — `[bold #BA55D3]N req | last XX ago[/]` (requests recorded), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
+- **CASPER** `OFFLOAD`: three-state — `[bold #BA55D3]N/M layers to GPU[/]` (offloading), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
+- `ai_req_count` / `ai_last_req_ts` are reset at the point where `ai_family` transitions to STBY or OFFLINE, not in the per-cycle cleanup block, to avoid losing accumulated counts during transient `/api/ps` empty responses.
+
 ## Completed Fixes
 
 - `build_balthasar()` state mutation in `render()` — moved `state.add_net_dn()` to `_collect()`
@@ -53,3 +60,6 @@ python magi_monitor_MIX.py
 - `generate_braille_trend()` double `min/max` — replaced with single-pass loop
 - Panel title/subtitle string rebuild — extracted as module constants
 - Comment language unified to Chinese
+- `build_casper()` / `build_balthasar()` — added `ai_family == "OFFLINE"` guard before other conditions in OFFLOAD / REQ items
+- Cleanup block — moved `ai_req_count` reset out of per-cycle cleanup to STBY/OFFLINE assignment sites, preventing count loss during transient `/api/ps` empty results
+- QUANT / REQ / OFFLOAD loaded-state color — `#00EEEE` → `bold #BA55D3` for better visibility

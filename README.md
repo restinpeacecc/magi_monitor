@@ -9,9 +9,9 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 ## ✨ 主要特性
 
 - **三贤者面板设计**：
-  - **MELCHIOR (01)**: CPU 监控（AMD Ryzen 7 7800X3D）
-  - **BALTHASAR (02)**: 系统状态（内存、网络、磁盘、TCP 连接）
-  - **CASPER (03)**: GPU 监控（NVIDIA RTX 5070）
+  - **MELCHIOR (01)**: CPU 监控（AMD Ryzen 7 7800X3D）+ Ollama 模型信息
+  - **BALTHASAR (02)**: 系统状态（内存、网络、磁盘、TCP 连接）+ Ollama 请求计数
+  - **CASPER (03)**: GPU 监控（NVIDIA RTX 5070）+ Ollama GPU 卸载状态
 
 - **实时监控指标**：
   - CPU/GPU 负载、频率、温度、电压、功耗
@@ -51,9 +51,28 @@ python magi_monitor_MIX.py
 |------|------|
 | `q` | 退出应用 |
 | `m` | 暂停并启动 pstop |
-| `y` | 暂停并启动 yazi |
 | `n` | 暂停并启动 psnet |
-| `o` | 暂停并启动 opencode |
+| `t` | 暂停并启动 yazi f:\ |
+| `x` | 暂停并启动 opencode D:\tools |
+
+## 🤖 Ollama 集成
+
+通过监听本地 Ollama 进程数据，在面板上实时显示：
+
+- **MELCHIOR QUANT**: 当前加载的模型家族与量化等级
+- **BALTHASAR REQ**: 累计推理请求数及距上次请求时间
+- **CASPER OFFLOAD**: 模型层在 GPU/CPU 间的卸载比例
+
+数据来源：
+- `http://localhost:11434/api/ps` → 模型元数据（家族、量化）
+- `C:\Users\kugim\AppData\Local\Ollama\server.log` → GPU 卸载信息、GIN 请求日志
+
+三种状态：
+| 状态 | 颜色 | 含义 |
+|------|------|------|
+| 模型信息 | `bold #BA55D3` | 有模型加载 / 有请求记录 / 正在卸载 |
+| STBY | `green` | Ollama 在线但无模型 |
+| OFFLINE | `dim` | Ollama 服务不可达 |
 
 ## 🔧 配置说明
 
@@ -108,27 +127,29 @@ POWER_CRIT  = 300
 - PKG-W: 封装功耗
 - TEMP: 温度（颜色编码）
 - FAN: 风扇转速
+- QUANT: Ollama 模型信息（模型名+量化等级 / STBY / OFFLINE）
 - FUSE: 状态指示器（ECO/ACTIVE/HIGH-LOAD/OVERDRIVE）
 
 ### BALTHASAR (SYSTEM)
-- RAM: 内存使用量和进度条
-- NET DN/UP: 网络速度 + 峰值 + 趋势
-- DISK R/W: 磁盘读写速度
-- TCP EST/TW: TCP 连接数
+- MEMORY: 内存使用量和进度条
+- USED / FREE: 内存用量
+- NET-DN: 网络下载速度 + 峰值
+- DISK: 磁盘读写速度
+- TCP: EST/TW 连接数
 - PING: 网络延迟
-- UPTIME: 系统运行时间
-- MODE: 系统状态模式
+- REQ: Ollama API 请求计数（累计 + 距上次时间 / STBY / OFFLINE）
+- P-STAT: 功耗状态指示器
 
 ### CASPER (GPU)
 - LOAD: GPU 使用率进度条
 - FREQ: 当前频率 + 最小/最大值 + 趋势箭头
-- TREND: Braille 频率曲线
 - VRAM: 显存使用量和进度条
-- V-GPU: GPU 电压
-- BOARD-W: 整板功耗
+- VCORE: GPU 电压
+- TGP: 整板功耗
 - TEMP: 温度（颜色编码）
 - FAN: 风扇转速
-- PSTAT: 功率状态指示器
+- OFFLOAD: Ollama GPU 卸载层数（已卸载/总层数 / STBY / OFFLINE）
+- COMP: GPU 计算状态（IDLE / INIT / ENGAGED / RTX-ON）
 
 ## 🎨 视觉风格
 
@@ -136,6 +157,10 @@ POWER_CRIT  = 300
 - **温度颜色**: spring_green1 (<45°C) → yellow (45-68°C) → red1 (>68°C)
 - **趋势箭头**: ▲ (上升) / ▼ (下降) / ► (稳定)
 - **状态文本**: 带反转效果和闪烁动画
+- **AI 状态颜色**:
+  - `[bold #BA55D3]` (紫罗兰) — 模型已加载、有推理请求、GPU 卸载中
+  - `[green]` — STBY（Ollama 在线无模型）
+  - `[dim]` — OFFLINE（Ollama 不可达）
 
 ## ⚠️ 注意事项
 
