@@ -470,9 +470,9 @@ def build_melchior() -> Panel:
     if state.ai_family == "OFFLINE":
         quant_str = "[dim]OFFLINE[/]"
     elif state.ai_family == "STBY":
-        quant_str = "[green]STBY[/]"
+        quant_str = "[#9c0f0f]STBY[/]"
     else:
-        quant_str = f"[bold #BA55D3]{state.ai_family}  {state.ai_quant}[/]"
+        quant_str = f"[bold green]{state.ai_family}  {state.ai_quant}[/]"
     t.add_row("MODEL", quant_str)
     
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
@@ -554,9 +554,9 @@ def build_balthasar() -> Panel:
     elif state.ai_req_count > 0:
         ago = time.time() - state.ai_last_req_ts
         ago_str = f"{ago:.0f}s ago" if ago < 120 else f"{ago/60:.0f}m ago"
-        load_str = f"[bold #BA55D3]{state.ai_req_count} req[/] [dim]| last {ago_str}[/]"
+        load_str = f"[bold green]{state.ai_req_count} req[/] [dim]| last {ago_str}[/]"
     else:
-        load_str = "[green]STBY[/]"
+        load_str = "[#9c0f0f]STBY[/]"
     t.add_row("REQ",  load_str)
     
     # ── 边框逻辑直接在这里决定 ──
@@ -612,9 +612,9 @@ def build_casper() -> Panel:
     if state.ai_family == "OFFLINE":
         offload_str = "[dim]OFFLINE[/]"
     elif state.ai_offload_total > 0:
-        offload_str = f"[bold #BA55D3]{state.ai_offload_gpu}/{state.ai_offload_total} layers to GPU[/]"
+        offload_str = f"[bold green]{state.ai_offload_gpu}/{state.ai_offload_total} layers to GPU[/]"
     else:
-        offload_str = "[green]STBY[/]"
+        offload_str = "[#9c0f0f]STBY[/]"
     t.add_row("OFFLOAD", offload_str)
     
     # ── 边框逻辑直接在这里决定 ──
