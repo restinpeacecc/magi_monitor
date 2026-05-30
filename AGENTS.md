@@ -46,9 +46,9 @@ python magi_monitor_MIX.py
 
 ## AI State Display
 
-- **MELCHIOR** `QUANT`: three-state — `[bold #e615b8]family quant[/]` (model loaded), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
-- **BALTHASAR** `REQ`: three-state — `[bold #e615b8]N req | last XX ago[/]` (requests recorded), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
-- **CASPER** `OFFLOAD`: three-state — `[bold #e615b8]N/M layers to GPU[/]` (offloading), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
+- **MELCHIOR** `MODEL`: three-state — `[bold #00ff00]family quant[/]` (model loaded), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
+- **BALTHASAR** `REQ`: three-state — `[bold #00ff00]N req | last XX ago[/]` (requests recorded), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
+- **CASPER** `OFFLOAD`: three-state — `[bold #00ff00]N/M layers to GPU[/]` (offloading), `[green]STBY[/]` (idle), `[dim]OFFLINE[/]` (Ollama unreachable)
 - `ai_req_count` / `ai_last_req_ts` are reset at the point where `ai_family` transitions to STBY or OFFLINE, not in the per-cycle cleanup block, to avoid losing accumulated counts during transient `/api/ps` empty responses.
 
 ## Completed Fixes
@@ -62,4 +62,4 @@ python magi_monitor_MIX.py
 - Comment language unified to Chinese
 - `build_casper()` / `build_balthasar()` — added `ai_family == "OFFLINE"` guard before other conditions in OFFLOAD / REQ items
 - Cleanup block — moved `ai_req_count` reset out of per-cycle cleanup to STBY/OFFLINE assignment sites, preventing count loss during transient `/api/ps` empty results
-- QUANT / REQ / OFFLOAD loaded-state color — `#00EEEE` → `bold #e615b8` for better visibility
+- MODEL / REQ / OFFLOAD loaded-state color — `#00EEEE` → `bold #00ff00` for better visibility
