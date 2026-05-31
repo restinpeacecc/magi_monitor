@@ -42,10 +42,6 @@ VRAM_USED_HIGH  = 50               # %
 CPU_FREQ_MIN = 3000.0              # MHz（Braille 曲线 Y 轴下限）
 CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
-# 面板标题/副标题常量
-PANEL_MELCHIOR_TITLE = "[bold orange3]MAGI-01: MELCHIOR[/]"
-PANEL_BALTHASAR_TITLE = "[bold orange3]MAGI-02: BALTHASAR[/]"
-PANEL_CASPER_TITLE = "[bold orange3]MAGI-03: CASPER[/]"
 
 # Ollama 日志路径
 OLLAMA_LOG_PATH = r"C:\Users\kugim\AppData\Local\Ollama\server.log"
@@ -117,6 +113,8 @@ class MagiState:
         self.ai_offload_total: int = 0      # 模型总层数
         self.ai_req_count: int = 0          # 累计推理请求数（从 GIN 日志解析）
         self.ai_last_req_ts: float = 0.0    # 最近一次推理请求的时间戳
+        self._prev_ai_family: str = ""      # 前一次 ai_family 值，用于检测转换
+        self._ai_empty_count: int = 0       # 空响应计数器（用于消除 /api/ps 瞬时空响应）
         
         # 新增：保护历史列表的锁
         self._list_lock = threading.Lock()
@@ -468,12 +466,12 @@ def build_melchior() -> Panel:
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     if state.ai_family == "OFFLINE":
-        quant_str = "[dim]OFFLINE[/]"
+        model_status = "[dim]OFFLINE[/]"
     elif state.ai_family == "STBY":
-        quant_str = "[#9c0f0f]STBY[/]"
+        model_status = "[#9c0f0f]STBY[/]"
     else:
-        quant_str = f"[bold green]{state.ai_family}  {state.ai_quant}[/]"
-    t.add_row("MODEL", quant_str)
+        model_status = f"[bold green]{state.ai_family}  {state.ai_quant}[/]"
+    mel_title = f"[bold orange3]MAGI-01[/] | {model_status}"
     
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
     flash = state.fuse_crit and state.fuse_blink_on
@@ -482,7 +480,7 @@ def build_melchior() -> Panel:
     # 构建 Panel，仅在 flash 为 True 时传入 box=HEAVY
     panel_kwargs = dict(
         renderable=t,
-        title=PANEL_MELCHIOR_TITLE,
+        title=mel_title,
         border_style=border,
         subtitle=fuse_indicator,
     )
@@ -550,14 +548,16 @@ def build_balthasar() -> Panel:
     t.add_row("TCP",    tcp_str) 
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
     if state.ai_family == "OFFLINE":
-        load_str = "[dim]OFFLINE[/]"
+        req_status = "[dim]OFFLINE[/]"
+    elif state.ai_family == "STBY":
+        req_status = "[#9c0f0f]STBY[/]"
     elif state.ai_req_count > 0:
         ago = time.time() - state.ai_last_req_ts
         ago_str = f"{ago:.0f}s ago" if ago < 120 else f"{ago/60:.0f}m ago"
-        load_str = f"[bold green]{state.ai_req_count} req[/] [dim]| last {ago_str}[/]"
+        req_status = f"[bold green]{state.ai_req_count} req | last {ago_str}[/]"
     else:
-        load_str = "[#9c0f0f]STBY[/]"
-    t.add_row("REQ",  load_str)
+        req_status = "[bold green]IDLE[/]"
+    bal_title = f"[bold orange3]MAGI-02[/] | {req_status}"
     
     # ── 边框逻辑直接在这里决定 ──
     flash = state.pstat_crit and state.pstat_blink_on
@@ -565,7 +565,7 @@ def build_balthasar() -> Panel:
 
     panel_kwargs = dict(
         renderable=t,
-        title=PANEL_BALTHASAR_TITLE,
+        title=bal_title,
         border_style=border,
         subtitle=blink_markup(p_text, p_color, p_freq),
     )
@@ -610,12 +610,14 @@ def build_casper() -> Panel:
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     if state.ai_family == "OFFLINE":
-        offload_str = "[dim]OFFLINE[/]"
+        offload_status = "[dim]OFFLINE[/]"
+    elif state.ai_family == "STBY":
+        offload_status = "[#9c0f0f]STBY[/]"
     elif state.ai_offload_total > 0:
-        offload_str = f"[bold green]{state.ai_offload_gpu}/{state.ai_offload_total} layers to GPU[/]"
+        offload_status = f"[bold green]{state.ai_offload_gpu}/{state.ai_offload_total} layers to GPU[/]"
     else:
-        offload_str = "[#9c0f0f]STBY[/]"
-    t.add_row("OFFLOAD", offload_str)
+        offload_status = "[bold green]LOADING...[/]"
+    cas_title = f"[bold orange3]MAGI-03[/] | {offload_status}"
     
     # ── 边框逻辑直接在这里决定 ──
     flash = state.comp_crit and state.comp_blink_on
@@ -623,7 +625,7 @@ def build_casper() -> Panel:
 
     panel_kwargs = dict(
         renderable=t,
-        title=PANEL_CASPER_TITLE,
+        title=cas_title,
         border_style=border,
         subtitle=ai,
     )
@@ -895,23 +897,18 @@ class MAGIApp(App):
                 r = requests.get("http://localhost:11434/api/ps", timeout=1)
                 models = r.json().get("models", [])
                 if models:
+                    state._ai_empty_count = 0
                     details = models[0].get("details", {})
                     state.ai_family = details.get("family", "?")
                     state.ai_quant = details.get("quantization_level", "?")
                 else:
-                    state.ai_family = "STBY"
-                    state.ai_quant = "STBY"
-                    state.ai_offload_gpu = 0
-                    state.ai_offload_total = 0
-                    state.ai_req_count = 0
-                    state.ai_last_req_ts = 0.0
+                    state._ai_empty_count += 1
+                    if state._ai_empty_count >= 2 and state._prev_ai_family != "STBY":
+                        state.ai_family = "STBY"
+                        state.ai_quant = "STBY"
             except Exception:
                 state.ai_family = "OFFLINE"
                 state.ai_quant = ""
-                state.ai_offload_gpu = 0
-                state.ai_offload_total = 0
-                state.ai_req_count = 0
-                state.ai_last_req_ts = 0.0
 
         # Ollama 日志扫描：GPU 卸载比 + GIN 推理请求
         if now - self._last_log_scan_time > 1.0:
@@ -940,10 +937,13 @@ class MAGIApp(App):
             except Exception:
                 state.ai_offload_pct = 0.0
 
-        # 无模型加载时清除日志残留的卸载信息
-        if state.ai_family in ("STBY", "OFFLINE"):
+        # 检测 ai_family 转换：从已加载 → STBY/OFFLINE 时清除派生数据
+        if state._prev_ai_family not in ("STBY", "OFFLINE") and state.ai_family in ("STBY", "OFFLINE"):
             state.ai_offload_gpu = 0
             state.ai_offload_total = 0
+            state.ai_req_count = 0
+            state.ai_last_req_ts = 0.0
+        state._prev_ai_family = state.ai_family
 
         # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
