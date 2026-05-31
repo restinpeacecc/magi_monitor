@@ -57,22 +57,24 @@ python magi_monitor_MIX.py
 
 ## 🤖 Ollama 集成
 
-通过监听本地 Ollama 进程数据，在面板上实时显示：
+通过监听本地 Ollama 进程数据，在面板**标题栏**（顶部边框）上实时显示：
 
-- **MELCHIOR QUANT**: 当前加载的模型家族与量化等级
-- **BALTHASAR REQ**: 累计推理请求数及距上次请求时间
-- **CASPER OFFLOAD**: 模型层在 GPU/CPU 间的卸载比例
+- **MELCHIOR (MAGI-01)**: 当前加载的模型家族与量化等级
+- **BALTHASAR (MAGI-02)**: 累计推理请求数及距上次请求时间
+- **CASPER (MAGI-03)**: 模型层在 GPU/CPU 间的卸载比例
 
 数据来源：
 - `http://localhost:11434/api/ps` → 模型元数据（家族、量化）
 - `C:\Users\kugim\AppData\Local\Ollama\server.log` → GPU 卸载信息、GIN 请求日志
 
-三种状态：
+状态说明：
 | 状态 | 颜色 | 含义 |
 |------|------|------|
-| 模型信息 | `bold #BA55D3` | 有模型加载 / 有请求记录 / 正在卸载 |
-| STBY | `green` | Ollama 在线但无模型 |
-| OFFLINE | `dim` | Ollama 服务不可达 |
+| `gemma4 Q4_K_M` | `bold green` | 有模型加载 / 有请求记录 / 正在卸载 |
+| `IDLE` | `bold green` | 模型已加载，尚无请求日志 |
+| `LOADING...` | `bold green` | 模型已加载，等待卸载层数日志 |
+| `STBY` | `#9c0f0f` | Ollama 在线但无模型 |
+| `OFFLINE` | `dim` | Ollama 服务不可达 |
 
 ## 🔧 配置说明
 
@@ -120,6 +122,7 @@ POWER_CRIT  = 300
 ## 📊 面板说明
 
 ### MELCHIOR (CPU)
+- 标题栏: Ollama 模型状态（`family quant` / `STBY` / `OFFLINE`）
 - LOAD: CPU 使用率进度条
 - FREQ: 当前频率 + 最小/最大值 + 趋势箭头
 - TREND: Braille 频率曲线（5 分钟历史）
@@ -127,20 +130,20 @@ POWER_CRIT  = 300
 - PKG-W: 封装功耗
 - TEMP: 温度（颜色编码）
 - FAN: 风扇转速
-- MODEL: Ollama 模型信息（模型名+量化等级 / STBY / OFFLINE）
 - FUSE: 状态指示器（ECO/ACTIVE/HIGH-LOAD/OVERDRIVE）
 
 ### BALTHASAR (SYSTEM)
+- 标题栏: Ollama 请求状态（`N req | last XX ago` / `IDLE` / `STBY` / `OFFLINE`）
 - MEMORY: 内存使用量和进度条
 - USED / FREE: 内存用量
 - NET-DN: 网络下载速度 + 峰值
 - DISK: 磁盘读写速度
 - TCP: EST/TW 连接数
 - PING: 网络延迟
-- REQ: Ollama API 请求计数（累计 + 距上次时间 / STBY / OFFLINE）
 - P-STAT: 功耗状态指示器
 
 ### CASPER (GPU)
+- 标题栏: Ollama GPU 卸载状态（`N/M layers to GPU` / `LOADING...` / `STBY` / `OFFLINE`）
 - LOAD: GPU 使用率进度条
 - FREQ: 当前频率 + 最小/最大值 + 趋势箭头
 - VRAM: 显存使用量和进度条
@@ -148,7 +151,6 @@ POWER_CRIT  = 300
 - TGP: 整板功耗
 - TEMP: 温度（颜色编码）
 - FAN: 风扇转速
-- OFFLOAD: Ollama GPU 卸载层数（已卸载/总层数 / STBY / OFFLINE）
 - COMP: GPU 计算状态（IDLE / INIT / ENGAGED / RTX-ON）
 
 ## 🎨 视觉风格
@@ -158,8 +160,8 @@ POWER_CRIT  = 300
 - **趋势箭头**: ▲ (上升) / ▼ (下降) / ► (稳定)
 - **状态文本**: 带反转效果和闪烁动画
 - **AI 状态颜色**:
-  - `[bold #00ff00]` (绿色) — 模型已加载、有推理请求、GPU 卸载中
-  - `[green]` — STBY（Ollama 在线无模型）
+  - `[bold #00ff00]` (绿色) — 模型已加载、有推理请求、GPU 卸载中，以及过渡态 IDLE/LOADING...
+  - `[#9c0f0f]` (深红) — STBY（Ollama 在线无模型）
   - `[dim]` — OFFLINE（Ollama 不可达）
 
 ## ⚠️ 注意事项
