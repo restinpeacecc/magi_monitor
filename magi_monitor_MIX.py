@@ -43,9 +43,6 @@ CPU_FREQ_MIN = 3000.0              # MHz（Braille 曲线 Y 轴下限）
 CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
 
-# Ollama 日志路径
-OLLAMA_LOG_PATH = r"C:\Users\kugim\AppData\Local\Ollama\server.log"
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  状态
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,16 +102,6 @@ class MagiState:
         self.pstat_blink_on: bool = False
         self.comp_blink_on: bool = False
         
-        # Ollama AI
-        self.ai_family: str = "—"           # 模型家族 e.g. "gemma4"
-        self.ai_quant: str = "—"            # 量化等级 e.g. "Q4_K_M"
-        self.ai_offload_pct: float = 0.0    # GPU 卸载百分比
-        self.ai_offload_gpu: int = 0        # 卸载到 GPU 的层数
-        self.ai_offload_total: int = 0      # 模型总层数
-        self.ai_req_count: int = 0          # 累计推理请求数（从 GIN 日志解析）
-        self.ai_last_req_ts: float = 0.0    # 最近一次推理请求的时间戳
-        self._prev_ai_family: str = ""      # 前一次 ai_family 值，用于检测转换
-        self._ai_empty_count: int = 0       # 空响应计数器（用于消除 /api/ps 瞬时空响应）
         
         # 新增：保护历史列表的锁
         self._list_lock = threading.Lock()
@@ -465,13 +452,7 @@ def build_melchior() -> Panel:
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
-    if state.ai_family == "OFFLINE":
-        model_status = "[dim]OFFLINE[/]"
-    elif state.ai_family == "STBY":
-        model_status = "[#9c0f0f]STBY[/]"
-    else:
-        model_status = f"[bold green]{state.ai_family}  {state.ai_quant}[/]"
-    mel_title = f"[bold orange3]MAGI-01[/] | {model_status}"
+    mel_title = "[bold orange3]MAGI-01[/] | MELCHIOR"
     
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
     flash = state.fuse_crit and state.fuse_blink_on
@@ -547,17 +528,7 @@ def build_balthasar() -> Panel:
     t.add_row("PING",   ping_str)
     t.add_row("TCP",    tcp_str) 
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
-    if state.ai_family == "OFFLINE":
-        req_status = "[dim]OFFLINE[/]"
-    elif state.ai_family == "STBY":
-        req_status = "[#9c0f0f]STBY[/]"
-    elif state.ai_req_count > 0:
-        ago = time.time() - state.ai_last_req_ts
-        ago_str = f"{ago:.0f}s ago" if ago < 120 else f"{ago/60:.0f}m ago"
-        req_status = f"[bold green]{state.ai_req_count} req | last {ago_str}[/]"
-    else:
-        req_status = "[bold green]IDLE[/]"
-    bal_title = f"[bold orange3]MAGI-02[/] | {req_status}"
+    bal_title = "[bold orange3]MAGI-02[/] | BALTHASAR"
     
     # ── 边框逻辑直接在这里决定 ──
     flash = state.pstat_crit and state.pstat_blink_on
@@ -609,15 +580,7 @@ def build_casper() -> Panel:
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
-    if state.ai_family == "OFFLINE":
-        offload_status = "[dim]OFFLINE[/]"
-    elif state.ai_family == "STBY":
-        offload_status = "[#9c0f0f]STBY[/]"
-    elif state.ai_offload_total > 0:
-        offload_status = f"[bold green]{state.ai_offload_gpu}/{state.ai_offload_total} layers to GPU[/]"
-    else:
-        offload_status = "[bold green]LOADING...[/]"
-    cas_title = f"[bold orange3]MAGI-03[/] | {offload_status}"
+    cas_title = "[bold orange3]MAGI-03[/] | CASPER"
     
     # ── 边框逻辑直接在这里决定 ──
     flash = state.comp_crit and state.comp_blink_on
@@ -772,9 +735,6 @@ class MAGIApp(App):
         ]
         self.set_interval(0.2, self._tick)     # 高频：传感器
         self.set_interval(5.0, self._collect_slow_tasks) # 低频：Ping/TCP
-        self._last_ollama_ps_time = 0.0
-        self._last_log_scan_time = 0.0
-        self._log_last_pos = 0  # 日志增量读取位置
 
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
@@ -888,62 +848,6 @@ class MAGIApp(App):
         state.pstat_crit = (total_pwr >= POWER_CRIT)
         # COMP (Casper) 的临界判断基于 GPU 负载和 VRAM 使用率 (与 build_casper 中的最高等级逻辑一致)
         state.comp_crit = (state.gpu_load >= GPU_LOAD_HIGH and state.vram_used_pct >= VRAM_USED_HIGH)
-
-        # ── Ollama 数据采集（按时间守卫）────────────────────────────────
-        now = time.time()
-        if now - self._last_ollama_ps_time > 1.0:
-            self._last_ollama_ps_time = now
-            try:
-                r = requests.get("http://localhost:11434/api/ps", timeout=1)
-                models = r.json().get("models", [])
-                if models:
-                    state._ai_empty_count = 0
-                    details = models[0].get("details", {})
-                    state.ai_family = details.get("family", "?")
-                    state.ai_quant = details.get("quantization_level", "?")
-                else:
-                    state._ai_empty_count += 1
-                    if state._ai_empty_count >= 2 and state._prev_ai_family != "STBY":
-                        state.ai_family = "STBY"
-                        state.ai_quant = "STBY"
-            except Exception:
-                state.ai_family = "OFFLINE"
-                state.ai_quant = ""
-
-        # Ollama 日志扫描：GPU 卸载比 + GIN 推理请求
-        if now - self._last_log_scan_time > 1.0:
-            self._last_log_scan_time = now
-            try:
-                with open(OLLAMA_LOG_PATH, "r", encoding="utf-8") as f:
-                    if self._log_last_pos > 0:
-                        try:
-                            f.seek(self._log_last_pos)
-                        except OSError:
-                            self._log_last_pos = 0  # 日志轮转，从头开始
-                    for line in f:
-                        clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', line)
-                        # GPU 卸载比
-                        m = re.search(r'offloaded (\d+)/(\d+) layers to GPU', clean)
-                        if m:
-                            state.ai_offload_gpu = int(m.group(1))
-                            state.ai_offload_total = int(m.group(2))
-                            state.ai_offload_pct = state.ai_offload_gpu / state.ai_offload_total * 100
-                        # GIN 推理请求
-                        m = re.match(r'\[GIN\].*?\|.*?\|.*?\|.*?\| \w+\s+"(/api/generate|/api/chat|/v1/chat/completions|/v1/completions)"', clean)
-                        if m:
-                            state.ai_req_count += 1
-                            state.ai_last_req_ts = time.time()
-                    self._log_last_pos = f.tell()
-            except Exception:
-                state.ai_offload_pct = 0.0
-
-        # 检测 ai_family 转换：从已加载 → STBY/OFFLINE 时清除派生数据
-        if state._prev_ai_family not in ("STBY", "OFFLINE") and state.ai_family in ("STBY", "OFFLINE"):
-            state.ai_offload_gpu = 0
-            state.ai_offload_total = 0
-            state.ai_req_count = 0
-            state.ai_last_req_ts = 0.0
-        state._prev_ai_family = state.ai_family
 
         # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
