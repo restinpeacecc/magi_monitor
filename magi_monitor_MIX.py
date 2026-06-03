@@ -4,11 +4,13 @@ MAGI SYSTEM Monitor — Textual Edition
 MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CSS 布局）
 """
 
+import os
 import re
 import subprocess
 import time
 import threading
 from datetime import datetime
+from pathlib import Path
 
 import psutil
 import requests
@@ -42,6 +44,19 @@ VRAM_USED_HIGH  = 50               # %
 CPU_FREQ_MIN = 3000.0              # MHz（Braille 曲线 Y 轴下限）
 CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
+LOG_DIR = "logs"
+LOG_FILE = "logs/crash_log.csv"
+LOG_MAX_BYTES = 512 * 1024         # 512 KB
+LOG_COLUMNS = [
+    "time","cpu_load","cpu_temp","cpu_pkg_w","cpu_eff_freq","cstate","cpu_fan",
+    "cpu_vid1","cpu_vid2","cpu_vid3","cpu_vid4","cpu_vid5","cpu_vid6","cpu_vid7","cpu_vid8",
+    "mem_pct","mem_temp",
+    "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status",
+    "pcie_rx","pcie_tx",
+    "v3v3","vcore_v",
+    "top_proc","top_cpu"
+]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  状态
@@ -60,6 +75,8 @@ class MagiState:
         self.current_cpu_power = 0.0
         self.cpu_temp = 0.0
         self.cpu_fan = "0"
+        self.cpu_vids: list[float] = [0.0] * 8
+        self.cpu_eff_freq: float = 0.0
 
         # GPU
         self.gpu_load = 0.0
@@ -69,6 +86,9 @@ class MagiState:
         self.current_gpu_power = 0.0
         self.gpu_temp = 0.0
         self.gpu_fan = "0"
+        self.gpu_mem_junc_temp: float = 0.0
+        self.pcie_rx_mbs: float = 0.0
+        self.pcie_tx_mbs: float = 0.0
 
         # 其他
         self.used_p = 0.0
@@ -93,7 +113,17 @@ class MagiState:
         self.disk_r: float = 0.0
         self.disk_w: float = 0.0
         self.ping_ms: float = 0.0
-        
+        self.mem_temp: float = 0.0
+        self.v3v3: float = 0.0
+        self.vcore_v: float = 0.0
+
+        # C-State / GPU 状态 / 最高 CPU 进程
+        self.cpu_cstate_level: str = "C?"
+        self.gpu_status: str = "?"
+        self._last_gpu_status_update: float = 0.0
+        self.top_proc_name: str = ""
+        self.top_proc_cpu: float = 0.0
+
         # 新增：面板临界状态和闪烁状态
         self.fuse_crit: bool = False
         self.pstat_crit: bool = False
@@ -222,6 +252,69 @@ class MagiState:
             except Exception:
                 self.weather = "OFFLINE"
 
+    # ── GPU 运行状态（基于 nvidia-smi Clocks Event Reasons） ──
+
+    def update_gpu_status(self):
+        now = time.time()
+        if now - self._last_gpu_status_update < 5:
+            return
+        self._last_gpu_status_update = now
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "-q", "-d", "PERFORMANCE"],
+                capture_output=True, text=True, timeout=3
+            )
+            reasons = {}
+            for line in r.stdout.splitlines():
+                m = re.search(r":\s*(Active|Not Active)$", line)
+                if m:
+                    name = line.split(":")[0].strip()
+                    reasons[name] = m.group(1)
+
+            if reasons.get("SW Thermal Slowdown") == "Active" or \
+               reasons.get("HW Thermal Slowdown") == "Active":
+                self.gpu_status = "THR"
+            elif reasons.get("SW Power Cap") == "Active" or \
+                 reasons.get("HW Power Brake Slowdown") == "Active":
+                self.gpu_status = "PWR"
+            elif reasons.get("Idle") == "Active":
+                self.gpu_status = "STBY"
+            elif self.gpu_load >= 30 and \
+                 all(v == "Not Active" for v in reasons.values()):
+                self.gpu_status = "BOOST"
+            elif self.gpu_load >= 10:
+                self.gpu_status = "NORM"
+            else:
+                self.gpu_status = "STBY"
+        except Exception:
+            self.gpu_status = "?"
+
+    # ── 最高 CPU 占用进程 ─────────────────────────────────────
+
+    def update_top_process(self):
+        try:
+            max_proc, max_cpu = "", 0.0
+            for p in psutil.process_iter(["name", "cpu_percent"]):
+                try:
+                    name = p.info["name"] or ""
+                    if name in ("System Idle Process", "Idle"):
+                        continue
+                    cpu = p.info["cpu_percent"] or 0
+                    if cpu > max_cpu:
+                        max_cpu = cpu
+                        max_proc = name
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if max_proc:
+                max_proc = max_proc.replace(".exe", "").replace(".EXE", "")
+                self.top_proc_name = max_proc[:10]
+            else:
+                self.top_proc_name = ""
+            self.top_proc_cpu = max_cpu
+        except Exception:
+            self.top_proc_name = ""
+            self.top_proc_cpu = 0.0
+
     # ── PING──────────────────────────────────────────────────
 
     def update_ping(self, target: str = "8.8.8.8", timeout: int = 1):
@@ -288,8 +381,24 @@ scanner = MAGIScanner()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_n(v_str: str | None) -> float:
+    """安全地将字符串（如 '4570.0 MHz'）转换为 float，失败时返回 0.0"""
     if not v_str:
         return 0.0
+    try:
+        return float(str(v_str).replace(",", "").split()[0])
+    except (ValueError, TypeError):
+        return 0.0
+
+def ratio_to_cstate(ratio: float) -> str:
+    """将有效频率/标称频率比值映射为 C-State 等级 (C0~C7)"""
+    if ratio > 0.90: return "C0"
+    if ratio > 0.70: return "C1"
+    if ratio > 0.50: return "C2"
+    if ratio > 0.25: return "C3"
+    if ratio > 0.12: return "C4"
+    if ratio > 0.05: return "C5"
+    if ratio > 0.02: return "C6"
+    return "C7"
     try:
         return float(str(v_str).replace(",", "").split()[0])
     except Exception:
@@ -315,10 +424,10 @@ def get_status_theme(value, safe_limit, warn_limit, crit_limit) -> tuple:
     if val >= crit_limit:
         return "bold red1",      2.5,   "CRITICAL"
     if val >= warn_limit:
-        return "bold gold1",     1,   "WARNING"
+        return "bold gold1",     1,   "WARN"
     if val >= safe_limit:
-        return "bold green",     0.5, "CAUTION"
-    return "cyan",               0,   "[reverse] STABLE [/reverse]"
+        return "bold green",     0.5, "ATTN"
+    return "cyan",               0,   "[reverse] STBL [/reverse]"
 
 def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     val = float(value_str)
@@ -326,9 +435,9 @@ def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     if val >= crit_limit:
         return "bold red1",      2.5,  "OVERDRIVE"
     if val >= warn_limit:
-        return "bold gold1",     1,  "HIGH-LOAD"
+        return "bold gold1",     1,  "HPC"
     if val >= safe_limit:
-        return "bold green",     0.5,  "ACTIVE"
+        return "bold green",     0.5,  "ACTV"
     return "cyan",               0,    "[reverse] ECO [/reverse]"
 
 def blink_markup(text: str, color: str, freq: float) -> str:
@@ -452,7 +561,9 @@ def build_melchior() -> Panel:
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
-    mel_title = "[bold orange3]MAGI-01[/] | MELCHIOR"
+    _cstate_color = {"C7": "cyan", "C6": "cyan", "C5": "green", "C4": "green",
+                      "C3": "yellow", "C2": "yellow", "C1": "red1", "C0": "red1"}.get(state.cpu_cstate_level, "cyan")
+    mel_title = f"[bold orange3]MELCHIOR[/] | [bold {_cstate_color}]{state.cpu_cstate_level}[/]"
     
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
     flash = state.fuse_crit and state.fuse_blink_on
@@ -528,7 +639,9 @@ def build_balthasar() -> Panel:
     t.add_row("PING",   ping_str)
     t.add_row("TCP",    tcp_str) 
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
-    bal_title = "[bold orange3]MAGI-02[/] | BALTHASAR"
+    _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red1"
+    _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
+    bal_title = f"[bold orange3]BALTHASAR[/] | [bold {_top_color}]{_top_display}[/]"
     
     # ── 边框逻辑直接在这里决定 ──
     flash = state.pstat_crit and state.pstat_blink_on
@@ -554,10 +667,10 @@ def build_casper() -> Panel:
         ai = "[bold red1][reverse] RTX-ON [/reverse][/]" if on else "[bold red1] RTX-ON [/]"
     elif state.gpu_load >= 30 and state.vram_used_pct >= 30:                      # 中负荷
         on = (time.time() * 2) % 2 < 1                  # 1 Hz
-        ai = "[bold gold1][reverse] ENGAGED [/reverse][/]" if on else "[bold gold1] ENGAGED [/]"
+        ai = "[bold gold1][reverse] LCK [/reverse][/]" if on else "[bold gold1] LCK [/]"
     elif state.gpu_load >= 10:                                     # 低负荷（仅 GPU 核心有活动）
         on = (time.time() * 1) % 2 < 1                  # 0.5 Hz
-        ai = "[bold green][reverse] INIT [/reverse][/]" if on else "[bold green] INIT [/]"
+        ai = "[bold green][reverse] TRG [/reverse][/]" if on else "[bold green] TRG [/]"
     else:
         ai = "[cyan][reverse] IDLE [/reverse][/]"       # 空闲
 
@@ -580,7 +693,8 @@ def build_casper() -> Panel:
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
-    cas_title = "[bold orange3]MAGI-03[/] | CASPER"
+    _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
+    cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
     
     # ── 边框逻辑直接在这里决定 ──
     flash = state.comp_crit and state.comp_blink_on
@@ -726,6 +840,8 @@ class MAGIApp(App):
     def on_mount(self) -> None:
         # 先显示启动动画屏幕
         self.push_screen(SplashScreen())
+        # 初始化崩溃日志（裁剪到 30 分钟窗口）
+        self._init_log()
         # 缓存面板引用，避免 _refresh_all 中重复 query
         self._refresh_widgets = [
             self.query_one(MAGIHeader),
@@ -733,8 +849,9 @@ class MAGIApp(App):
             self.query_one(BalthasarPanel),
             self.query_one(CasperPanel),
         ]
-        self.set_interval(0.2, self._tick)     # 高频：传感器
-        self.set_interval(5.0, self._collect_slow_tasks) # 低频：Ping/TCP
+        self.set_interval(0.2, self._tick)     # 高频：传感器（0.2s）
+        self.set_interval(5.0, self._collect_slow_tasks) # 低频：Ping/TCP/GPU状态
+        self.set_interval(1.0, self._log_tick) # 日志写入（1s）
 
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
@@ -767,10 +884,21 @@ class MAGIApp(App):
         
         freq_str = scanner.get_val("Cores (Average)", "MHz")
         if freq_str:
-            state.add_cpu_freq(parse_n(freq_str))
+            f_nom = parse_n(freq_str)
+            state.add_cpu_freq(f_nom)
 
-        v_list   = [parse_n(scanner.get_val(f"Core #{i} VID", "V")) for i in range(1, 9)]
-        v_list   = [v for v in v_list if v > 0]
+        eff_str = scanner.get_val("Cores (Average Effective)", "MHz")
+        if eff_str:
+            state.cpu_eff_freq = parse_n(eff_str)
+        if eff_str and freq_str:
+            f_eff = parse_n(eff_str)
+            f_nom = parse_n(freq_str)
+            state.cpu_cstate_level = ratio_to_cstate(f_eff / f_nom) if f_nom > 0 else "C?"
+
+        state.cpu_vids = [
+            parse_n(scanner.get_val(f"Core #{i} VID", "V")) for i in range(1, 9)
+        ]
+        v_list   = [v for v in state.cpu_vids if v > 0]
         state.avg_volt = sum(v_list) / len(v_list) if v_list else 0.0
     
         cpu_pwr = scanner.get_val("Package", "W")
@@ -797,7 +925,7 @@ class MAGIApp(App):
         state.vram_used_pct = (v_used / v_total * 100) if v_total > 0 else 0.0
 
         gpu_volt_val = scanner.get_val("GPU Core Voltage", "V")
-        if gpu_volt_val: state.gpu_volt = gpu_volt_val
+        if gpu_volt_val is not None: state.gpu_volt = parse_n(gpu_volt_val)
 
         gpu_p_raw = scanner.get_val("GPU Package", "W")
         if gpu_p_raw is not None:
@@ -806,6 +934,17 @@ class MAGIApp(App):
         gpu_temp_val = scanner.get_val("GPU Core", "°C")
         if gpu_temp_val is not None:
             state.gpu_temp = parse_n(gpu_temp_val)
+
+        mem_junc = scanner.get_val("GPU Memory Junction", "°C")
+        if mem_junc is not None:
+            state.gpu_mem_junc_temp = parse_n(mem_junc)
+
+        pcie_rx = scanner.get_val("GPU PCIe Rx")
+        if pcie_rx:
+            state.pcie_rx_mbs = parse_n(pcie_rx)
+        pcie_tx = scanner.get_val("GPU PCIe Tx")
+        if pcie_tx:
+            state.pcie_tx_mbs = parse_n(pcie_tx)
 
         fan_gpu = scanner.get_val("GPU Fan", "RPM")
         if fan_gpu: state.gpu_fan = fan_gpu
@@ -822,6 +961,17 @@ class MAGIApp(App):
         
         net_val = scanner.get_val("イーサネット Download Speed")
         if net_val: state.net_dn_raw = net_val
+
+        # 日志用传感器
+        dimm_t = scanner.get_val("DIMM #1", "°C")
+        if dimm_t is not None:
+            state.mem_temp = parse_n(dimm_t)
+        v3 = scanner.get_val("+3.3V", "V")
+        if v3 is not None:
+            state.v3v3 = parse_n(v3)
+        vc = scanner.get_val("Vcore", "V")
+        if vc is not None:
+            state.vcore_v = parse_n(vc)
 
         # 解析下载速度并记录最大值（从 render 中移至此，避免重复调用）
         dn_match = re.search(r"([0-9,.]+)\s*(KB|MB|GB)/s?", state.net_dn_raw, re.IGNORECASE)
@@ -854,9 +1004,80 @@ class MAGIApp(App):
     @work(thread=True, exclusive=True)
     def _collect_slow_tasks(self) -> None:
         """独立运行的慢速任务，不影响传感器刷新率"""
+        state.update_gpu_status()
+        state.update_top_process()
         state.update_ping()
         state.update_weather()  # HTTP (wttr.in) 每30分钟更新
         state.update_tcp_counts()
+
+    # ── 日志定时器 ────────────────────────────────────────────────────────────
+
+    def _log_tick(self) -> None:
+        """主线程调用的日志写入（1s），只有字符串格式化+文件追加，<1ms。"""
+        self._append_log()
+
+    # ── CSV 日志 ──────────────────────────────────────────────────────────────
+
+    def _init_log(self):
+        """启动时加载已有日志，裁剪到 30 分钟窗口。"""
+        log_path = Path(__file__).parent / LOG_FILE
+        if not log_path.parent.exists():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists():
+            try:
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                lines = []
+            if len(lines) > 1:
+                now_ts = time.time()
+                keep = [lines[0]]  # header
+                for line in lines[1:]:
+                    parts = line.split(",", 1)
+                    if len(parts) > 1:
+                        try:
+                            t = datetime.strptime(parts[0], "%m-%d %H:%M:%S")
+                            t = t.replace(year=datetime.now().year)
+                            if abs(now_ts - t.timestamp()) < 1800:
+                                keep.append(line)
+                        except ValueError:
+                            continue
+                log_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+
+    def _append_log(self):
+        """追加一行 CSV 日志，文件超限则裁剪。"""
+        log_path = Path(__file__).parent / LOG_FILE
+        if not log_path.parent.exists():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            t = datetime.now().strftime("%m-%d %H:%M:%S")
+            s = state
+            row = (
+                f"{t},{s.cpu_load:.1f},{s.cpu_temp:.1f},{s.current_cpu_power:.1f},"
+                f"{s.cpu_eff_freq:.0f},{s.cpu_cstate_level},{s.cpu_fan},"
+                f"{','.join(f'{v:.3f}' for v in s.cpu_vids)},"
+                f"{s.used_p:.1f},{s.mem_temp:.1f},"
+                f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
+                f"{s.current_gpu_power:.1f},{s.gpu_freq_history[-1] if s.gpu_freq_history else 0:.0f},"
+                f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},"
+                f"{s.pcie_rx_mbs:.1f},{s.pcie_tx_mbs:.1f},"
+                f"{s.v3v3:.3f},{s.vcore_v:.3f},"
+                f"{s.top_proc_name},{s.top_proc_cpu:.0f}\n"
+            )
+            exists = log_path.exists()
+            with log_path.open("a", encoding="utf-8", newline="") as f:
+                if not exists:
+                    f.write(",".join(LOG_COLUMNS) + "\n")
+                f.write(row)
+
+            if log_path.stat().st_size > LOG_MAX_BYTES:
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+                if len(lines) > 10:
+                    log_path.write_text(
+                        "\n".join([lines[0]] + lines[-(len(lines)//2):]) + "\n",
+                        encoding="utf-8"
+                    )
+        except Exception:
+            pass  # 日志写入失败不应影响主程序
 
     def _refresh_all(self) -> None:
         # 使用缓存的面板引用，避免每次刷新都执行 CSS 选择器查询

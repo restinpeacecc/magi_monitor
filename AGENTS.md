@@ -10,20 +10,36 @@ python magi_monitor_MIX.py
 
 - Single-file Textual TUI app (`magi_monitor_MIX.py`), entry point: `MAGIApp().run()`
 - Reads hardware sensors from **OpenHardwareMonitor / LibreHardwareMonitor** JSON API at `http://localhost:8085/data.json` via `MAGIScanner`
+- GPU status via `nvidia-smi -q -d PERFORMANCE` (Clocks Event Reasons → IDLE/PWR/HOT/BOOST)
 - Requires `psutil` and `requests` (no `pyproject.toml` / `requirements.txt` — install manually)
 - No test suite, no lint/typecheck config
 
-## Threading Model
+## Three-Tier Threading Model
 
-- `_collect()` runs in a background thread (`@work(thread=True, exclusive=True)`) every 0.2s — does blocking HTTP to OHM + psutil calls
-- `_collect_slow_tasks()` runs every 5s in a separate thread — ping, weather (wttr.in), TCP counts
-- `_tick()` runs on the main event loop — handles alerts, blink state, and calls `_refresh_all()`
+| Timer | Period | Worker | Tasks |
+|-------|--------|--------|-------|
+| `_tick` | **0.2s** | `@work(thread, exclusive)` | OHM sensor polling, psutil, freq history, alerts |
+| `_log_tick` | **1s** | Main thread | CSV log append (file I/O < 1ms) |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | nvidia-smi GPU status, top CPU process, ping, weather, TCP |
+
 - **State (`MagiState`) is shared between threads without locks** on scalar fields. Only the freq history lists are protected by `_list_lock`. When modifying state fields, be aware of potential data races.
 
-## Known Issues to Fix
+## Panel Titles
 
-1. **`refresh_disk_speed()` crashes if `psutil.disk_io_counters()` returns `None`** — add a guard.
-2. **`update_tcp_counts()` swallows all exceptions silently** — add logging.
+| Panel | Title Format | Example | Source |
+|-------|-------------|---------|--------|
+| MELCHIOR (CPU) | `MELCHIOR \| C{n}` | `MELCHIOR \| C5` | Effective/Nominal freq ratio → C0~C7, color-coded |
+| BALTHASAR (System) | `BALTHASAR \| {name} {cpu}%` | `BALTHASAR \| chrome 23%` | Top CPU-consuming process (`.exe` stripped, 10 char trunc) |
+| CASPER (GPU) | `CASPER \| {status}` | `CASPER \| STBY` | nvidia-smi Clocks Event Reasons → IDLE/STBY/BOOST/PWR/HOT |
+
+## Crash Recovery Log (`logs/crash_log.csv`)
+
+- **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
+- **Columns** (31 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vid1~8,mem_pct,mem_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,pcie_rx,pcie_tx,v3v3,vcore_v,top_proc,top_cpu`
+- **Writing**: `_log_tick()` every 1s, simple `open+append` on main thread
+- **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)
+- **Size cap**: `LOG_MAX_BYTES = 512KB` → auto trims to half when exceeded
+- **Silent failure**: All I/O exceptions caught, never crashes the app
 
 ## Key Bindings
 
@@ -56,3 +72,8 @@ python magi_monitor_MIX.py
 - Comment language unified to Chinese
 - `build_casper()` / `build_balthasar()` — added state guard for panel display
 - **Ollama monitoring removed**: The entire Ollama data collection (`/api/ps` polling + log scanning) and its AI state display fields were removed due to suspected system instability (freeze/black screen/reboot). Panel titles reverted to plain text.
+- `parse_n()` not stripping units ("MHz", "°C", etc.) — added `.split()[0]` to handle OHM's string-embedded unit values
+- C-State inference added — reads `Cores (Average Effective)` / `Cores (Average)` ratio → maps to C0~C7
+- GPU status replaces P-State — parses `nvidia-smi` Clocks Event Reasons for IDLE/PWR/HOT/BOOST
+- Top CPU process in BALTHASAR title — `psutil.process_iter(["name", "cpu_percent"])`, filters System Idle Process
+- Crash recovery log (`logs/crash_log.csv`) — 1s interval, 30min rolling window, 512KB cap, silent failure
