@@ -557,7 +557,7 @@ def build_melchior() -> Panel:
     t.add_row("LOAD",   generate_bar(state.cpu_load, color="orange3"))
     t.add_row("FREQ",  freq_str)
     t.add_row("TREND",  spark)
-    t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.4f} V[/]")
+    t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.3f} V[/]")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
@@ -689,7 +689,7 @@ def build_casper() -> Panel:
     t.add_row("LOAD",   generate_bar(state.gpu_load, color="red"))
     t.add_row("FREQ",   freq_display)          # 改用趋势显示
     t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="magenta"))
-    t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt or 'N/A'} V[/]")
+    t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
