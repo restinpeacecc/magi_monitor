@@ -457,7 +457,7 @@ def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     if val >= warn_limit:
         return "bold gold1",     1,  " HPC "
     if val >= safe_limit:
-        return "bold green",     0.5,  " ACTV "
+        return "bold green",     0.5,  " LPC "
     return "cyan",               0,    "[reverse] ECO [/reverse]"
 
 def blink_markup(text: str, color: str, freq: float) -> str:
