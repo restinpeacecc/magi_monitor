@@ -9,13 +9,15 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 ## ✨ 主要特性
 
 - **三贤者面板**：
-  - **MELCHIOR**: CPU 监控，标题栏显示 C-State (C0~C7)
-  - **BALTHASAR**: 系统状态，标题栏显示最高 CPU 占用进程
+  - **MELCHIOR**: CPU 监控，标题栏显示活跃核心数 `N/8 ACTV` + C-State 分组指示（C6|C7/C5|C4/C3|C2/C1|C0），热余量副标题指示灯
+  - **BALTHASAR**: 系统状态，标题栏显示最高 CPU 占用进程 + 功耗状态灯
   - **CASPER**: GPU 监控，标题栏显示 nvidia-smi Clocks Event Reasons
 
 - **实时监控**：CPU/GPU 负载、频率、温度、电压、功耗、C-State、GPU 电压/显存结温、PCIe 带宽、VRAM 使用率、+3.3V/Vcore 电压轨
-- **警报系统**：1 级 ≥75°C / 2 级 (ANGEL DETECTED) ≥80°C
-- **可视化**：Braille 频率趋势图、动态进度条、颜色编码状态
+- **每核 C-State 追踪**：基于有效频率/标称频率比推断 8 核独立 C-State
+- **活跃核心数**：复合判定（每核负载 > 10% OR 频比 > 0.15），SMT 双线程取最大值
+- **警报系统**：1 级 ≥75°C / 2 级 (ANGEL DETECTED) ≥80°C，面板边框临界闪烁
+- **可视化**：Braille 频率趋势图、动态进度条、颜色编码状态、闪动指示灯
 - **崩溃恢复日志**：1s 间隔写入 `logs/crash_log.csv`，30min 滚动窗口，512KB 封顶
 
 ## 🚀 安装依赖
@@ -37,11 +39,10 @@ python magi_monitor_MIX.py
 | `m` | 暂停并启动 pstop |
 | `n` | 暂停并启动 psnet |
 | `t` | 暂停并启动 yazi f:\ |
-| `x` | 暂停并启动 opencode D:\tools |
 
 ## 🔧 配置说明
 
-### 温度阈值
+### 温度阈值（面板边框闪烁触发）
 
 ```python
 CPU_TEMP_CAUTION    = 50   # °C
@@ -50,6 +51,14 @@ CPU_TEMP_CRITICAL   = 70   # °C（面板边框闪烁）
 ```
 
 1 级警报 75°C，2 级警报 (ANGEL DETECTED) 80°C。
+
+### 活跃核心判定（复合阈值）
+
+```python
+# 负载 > 10% OR 有效频率/标称频率比 > 0.15
+if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
+    combined_active += 1
+```
 
 ### 外部依赖
 
@@ -76,44 +85,45 @@ CPU_TEMP_CRITICAL   = 70   # °C（面板边框闪烁）
 ## 📊 面板说明
 
 ### MELCHIOR (CPU)
-- **标题**: `MELCHIOR | C{n}`，C-State 等级颜色编码（C7/C6 青色、C5/C4 绿色、C3/C2 黄色、C1/C0 红色）
+- **标题**: `MELCHIOR | N/8 ACTV`，活跃核心数颜色编码（0~1 青色、2~4 绿色、5~6 黄色、7~8 红色）
+- **副标题**: C-State 分组指示灯（C6|C7 青/reverse、C5|C4 绿闪、C3|C2 金闪、C1|C0 红闪）
 - LOAD: CPU 使用率进度条
-- FREQ: 当前/有效频率 + 趋势箭头
+- FREQ: 频率 + 趋势箭头 + 最小/最大值
 - TREND: Braille 频率曲线
-- V-AVG: 平均电压
-- PKG-W: 封装功耗 + PROCHOT 状态
-- TEMP: CPU 封装温度（颜色编码）
-- VID1~8: 各核心 VID 电压
-- FAN: CPU 风扇转速 + 分压比
+- V-AVG: 平均 VID 电压
+- PKG-W: CPU 封装功耗
+- TEMP: CPU 温度（颜色编码）
+- FAN: CPU 风扇转速
 
 ### BALTHASAR (SYSTEM)
-- **标题**: `BALTHASAR | {进程名} {cpu}%`，按 CPU% 着色（<10% 绿色、10-30% 黄色、>30% 红色）
+- **标题**: `BALTHASAR | {进程名} {cpu}%`，按 CPU% 着色（cyan <10% → green <50% → yellow <80% → red1）
+- **副标题**: 整机功耗状态灯（ECO/HPC/OVERDRIVE）
 - MEMORY: 内存使用率 + 进度条
-- TEMP: 内存温度
-- NET-DN / NET-UP: 网络下载/上传速度
-- PCIe RX / TX: PCIe 带宽
-- PING: 网络延迟
+- USED / FREE: 内存用量
+- NET-DN: 当前下载速度 @ 历史最大
+- PING: 网络延迟（颜色编码）
 - TCP: EST/TW 连接数
 - DISK: 磁盘读写速度
-- +3.3V / Vcore: 电压轨
-- P-STAT: 功耗状态
+- POWER: 整机估算功耗（CPU+GPU+基础偏移）
 
 ### CASPER (GPU)
-- **标题**: `CASPER | {status}`，状态映射：IDLE 绿色、STBY 青色、BOOST 黄色、PWR 红色、HOT 深红
+- **标题**: `CASPER | {status}`，状态映射：STBY 青、NORM 绿、BOOST 金、PWR 黄、THR 红
+- **副标题**: 负载状态灯（IDLE/TRG/LCK/RTX-ON）
 - LOAD: GPU 使用率进度条
 - FREQ: 核心频率 + 趋势箭头
-- VRAM: 显存使用率 + 进度条
+- VRAM: 显存使用率进度条
 - VCORE: GPU 电压
-- TGP: 整板功耗
+- TGP: GPU 封装功耗
 - TEMP: GPU 温度
-- MEM JUNCTION: 显存结温
 - FAN: 风扇转速
 
 ## 🎨 视觉风格
 
-- **边框颜色**: orange3（正常）/ bold red（临界闪烁）
+- **边框颜色**: orange3（正常）/ bold red（临界闪烁，HEAVY 加粗边框）
+- **面板标题**: 各面板独立颜色编码指示灯
 - **温度颜色**: spring_green1 (<45°C) → yellow (45-68°C) → red1 (>68°C)
 - **趋势箭头**: ▲ 上升 / ▼ 下降 / ► 稳定
+- **Header**: 居中显示，时间/运行时间/天气/主机名/日期
 
 ## 📝 崩溃恢复日志
 

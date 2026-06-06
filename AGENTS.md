@@ -28,7 +28,7 @@ python magi_monitor_MIX.py
 
 | Panel | Title Format | Example | Source |
 |-------|-------------|---------|--------|
-| MELCHIOR (CPU) | `MELCHIOR \| C{n}` | `MELCHIOR \| C5` | Effective/Nominal freq ratio → C0~C7, color-coded |
+| MELCHIOR (CPU) | `MELCHIOR \| N/8 ACTV` | `MELCHIOR \| 6/8 ACTV` | Active core count (load>10% OR freq ratio>0.15), color-coded |
 | BALTHASAR (System) | `BALTHASAR \| {name} {cpu}%` | `BALTHASAR \| chrome 23%` | Top CPU-consuming process (`.exe` stripped, 10 char trunc) |
 | CASPER (GPU) | `CASPER \| {status}` | `CASPER \| STBY` | nvidia-smi Clocks Event Reasons → IDLE/STBY/BOOST/PWR/HOT |
 
@@ -48,7 +48,6 @@ python magi_monitor_MIX.py
 | `m` | Launch `pstop` (via `self.suspend()`) |
 | `n` | Launch `psnet` |
 | `t` | Launch `yazi f:\` |
-| `x` | Launch `opencode D:\tools` |
 
 ## Conventions
 
@@ -58,7 +57,10 @@ python magi_monitor_MIX.py
 
 ## Design Notes
 
-- **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls panel border flash; `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications. These serve different UI purposes and should not be unified.
+- **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from OHM `Load/CPU Core #i` (with SMT: max of thread 1+9, 2+10, ...) and `Core #i (Effective)` / `Core #i`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
+- **MELCHIOR subtitle shows C-State groups**: `C6|C7` (cyan, reverse, no blink), `C5|C4` (green, 0.5Hz), `C3|C2` (gold, 1Hz), `C1|C0` (red, 2.5Hz). Derived from average effective/nominal frequency ratio.
+- **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `endswith` for additional safety.
+- **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls the panel border flash (`fuse_crit`). `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications (Toast notify). These serve different UI purposes and should not be unified.
 - **Panel titles are plain text**: After removing the unstable Ollama monitoring feature, panel titles show simple names (MELCHIOR / BALTHASAR / CASPER).
 
 ## Completed Fixes

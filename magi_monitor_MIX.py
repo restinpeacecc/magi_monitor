@@ -5,6 +5,7 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 """
 
 import os
+import platform as _platform
 import re
 import subprocess
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import psutil
 import requests
+from rich.align import Align
 from rich.panel import Panel
 from rich.table import Table
 from rich.box import HEAVY            # ← 新增：粗边框
@@ -32,7 +34,7 @@ BASE_POWER_OFFSET = 45.0            # 主板/风扇/SSD 等基础功耗 (W)
 
 CPU_TEMP_CAUTION    = 50           # °C
 CPU_TEMP_WARNING    = 60
-CPU_TEMP_CRITICAL   = 70           # °C（保持一致，与1级警报阈值相同）
+CPU_TEMP_CRITICAL   = 70           # °C（fuse_crit 边框闪烁触发点）
 
 POWER_SAFE  = 100                  # W
 POWER_WARN  = 180
@@ -123,6 +125,11 @@ class MagiState:
         self._last_gpu_status_update: float = 0.0
         self.top_proc_name: str = ""
         self.top_proc_cpu: float = 0.0
+
+        # 每核负载 / 每核 C-State / 活跃核心数（7800X3D = 8 物理核，16 逻辑线程）
+        self.core_loads: list[float] = [0.0] * 8
+        self.core_cstates: list[str] = ["C?"] * 8
+        self.active_cores: int = 0
 
         # 新增：面板临界状态和闪烁状态
         self.fuse_crit: bool = False
@@ -360,12 +367,35 @@ class MAGIScanner:
             self._walk(child, hw)
 
     def get_val(self, name_target: str, unit_target: str | None = None) -> str | None:
-        nl = name_target.lower()
+        """末尾锚定匹配，避免子串误中（'Cores (Average)' vs 'Cores (Average Effective)' / 'Core #1' vs 'Core #10'）"""
+        pattern = re.compile(r"(?:^|\W)" + re.escape(name_target.lower()) + r"$")
         for name_lower, val in self._cache:
-            if nl in name_lower:
+            if pattern.search(name_lower):
                 if unit_target is None or unit_target.lower() in val.lower():
                     return val
         return None
+
+    def get_core_freq(self, core_id: int) -> tuple[float, float]:
+        """返回 (标称 MHz, 有效 MHz);用 endswith 后缀匹配避免 'Core #1' 误中 'Core #10' / '(Effective)'。"""
+        suf_nom = f"core #{core_id}"
+        suf_eff = f"core #{core_id} (effective)"
+        nom = eff = 0.0
+        for name_lower, val in self._cache:
+            if not nom and name_lower.endswith(suf_nom) and "mhz" in val.lower():
+                nom = parse_n(val)
+            elif not eff and name_lower.endswith(suf_eff) and "mhz" in val.lower():
+                eff = parse_n(val)
+            if nom and eff:
+                break
+        return nom, eff
+
+    def get_core_load(self, cpu_id: int) -> float:
+        """返回逻辑 CPU #cpu_id 的负载 %;读不到时 0.0。"""
+        suf = f"cpu core #{cpu_id}"
+        for name_lower, val in self._cache:
+            if name_lower.endswith(suf) and "%" in val:
+                return parse_n(val)
+        return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -419,33 +449,23 @@ def get_temp_color(temp_val) -> str:
         return "yellow"
     return "red1"
 
-def get_status_theme(value, safe_limit, warn_limit, crit_limit) -> tuple:
-    val = float(value)
-    if val >= crit_limit:
-        return "bold red1",      2.5,   "CRITICAL"
-    if val >= warn_limit:
-        return "bold gold1",     1,   "WARN"
-    if val >= safe_limit:
-        return "bold green",     0.5, "ATTN"
-    return "cyan",               0,   "[reverse] STBL [/reverse]"
-
 def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     val = float(value_str)
     # 返回格式: (颜色, 闪烁频率, 显示文本)
     if val >= crit_limit:
-        return "bold red1",      2.5,  "OVERDRIVE"
+        return "bold red1",      2.5,  " OVERDRIVE "
     if val >= warn_limit:
-        return "bold gold1",     1,  "HPC"
+        return "bold gold1",     1,  " HPC "
     if val >= safe_limit:
-        return "bold green",     0.5,  "ACTV"
+        return "bold green",     0.5,  " ACTV "
     return "cyan",               0,    "[reverse] ECO [/reverse]"
 
 def blink_markup(text: str, color: str, freq: float) -> str:
     """基于 time.time() 的点灭标记（每次 render() 调用时重新计算）"""
     if freq <= 0:
-        return f"[{color}] {text} [/]"
+        return f"[{color}]{text}[/]"
     on = (time.time() * freq * 2) % 2 < 1
-    return f"[{color} reverse] {text} [/]" if on else f"[{color}] {text} [/]"
+    return f"[{color} reverse]{text}[/]" if on else f"[{color}]{text}[/]"
 
 def generate_braille_trend(values: list[float], width: int = 22, 
                            y_range: tuple[float, float] | None = None,
@@ -509,13 +529,15 @@ def get_trend_arrow(values: list[float], threshold: float = 20) -> str:
 def build_header() -> Panel:
     now = datetime.now().strftime("%H:%M:%S")
     uptime = state.get_uptime_str()
-    # 将 Uptime 整合进 Header
+    hostname = _platform.node().split(".")[0]
+    date_str = datetime.now().strftime("%m/%d (%a)")
     txt = (
         f"[bold green]MAGI SYSTEM[/] [dim]||[/] {now} "
         f"[dim]||[/] [bold red]UP: {uptime}[/] [dim]||[/] "
-        f"{state.weather} [dim]||[/] [bold green]SYNC: 100%[/]"
+        f"{state.weather} [dim]||[/] "
+        f"[bold yellow]{hostname}[/] [dim]|[/] {date_str}"
     )
-    return Panel(txt, border_style="orange3")
+    return Panel(Align.center(txt), border_style="orange3")
 
 
 def build_melchior() -> Panel:
@@ -546,11 +568,17 @@ def build_melchior() -> Panel:
     else:
         freq_str = "[dim]collecting...[/]"
         
-    color, freq, status_text = get_status_theme(
-        state.cpu_temp, CPU_TEMP_CAUTION, CPU_TEMP_WARNING, CPU_TEMP_CRITICAL
-    )
-
-    fuse_indicator = blink_markup(status_text, color, freq)
+    # ── C-State 副标题：C-State 分组指示灯（C6|C7/C5|C4/C3|C2/C1|C0） ──
+    _cs = state.cpu_cstate_level
+    if _cs in ("C0", "C1"):
+        _sub_color, _sub_freq, _sub_text = "bold red1", 2.5, " CRITICAL "
+    elif _cs in ("C2", "C3"):
+        _sub_color, _sub_freq, _sub_text = "bold gold1", 1, " WARN "
+    elif _cs in ("C4", "C5"):
+        _sub_color, _sub_freq, _sub_text = "bold green", 0.5, " ATTN "
+    else:
+        _sub_color, _sub_freq, _sub_text = "cyan", 0, "[reverse] STBL [/reverse]"
+    fuse_indicator = blink_markup(_sub_text, _sub_color, _sub_freq)
 
     t = Table.grid(padding=0)
     t.add_column(width=10)
@@ -561,9 +589,13 @@ def build_melchior() -> Panel:
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
-    _cstate_color = {"C7": "cyan", "C6": "cyan", "C5": "green", "C4": "green",
-                      "C3": "yellow", "C2": "yellow", "C1": "red1", "C0": "red1"}.get(state.cpu_cstate_level, "cyan")
-    mel_title = f"[bold orange3]MELCHIOR[/] | [bold {_cstate_color}]{state.cpu_cstate_level}[/]"
+    _active_color = "cyan" if state.active_cores <= 1 else \
+                    "green" if state.active_cores <= 4 else \
+                    "yellow" if state.active_cores <= 6 else "red1"
+    mel_title = (
+        f"[bold orange3]MELCHIOR[/] | "
+        f"[bold {_active_color}]{state.active_cores}/8 ACTV[/]"
+    )
     
     # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
     flash = state.fuse_crit and state.fuse_blink_on
@@ -826,7 +858,6 @@ class MAGIApp(App):
         Binding("m", "launch_pstop", "pstop", show=True),
         Binding("n", "launch_psnet", "psnet", show=True),
         Binding("t", "launch_yazi", "yazi", show=True),
-        Binding("x", "launch_opencode", "opencode", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -894,6 +925,25 @@ class MAGIApp(App):
             f_eff = parse_n(eff_str)
             f_nom = parse_n(freq_str)
             state.cpu_cstate_level = ratio_to_cstate(f_eff / f_nom) if f_nom > 0 else "C?"
+
+        # 每核负载 / C-State / 活跃核心数（复合判定:负载>10% OR 频比>0.15）
+        # 7800X3D: 8 物理核 × 2 线程(SMT);取同一物理核两线程的 max
+        loads: list[float] = []
+        cstates: list[str] = []
+        combined_active = 0
+        for i in range(8):
+            t1 = scanner.get_core_load(i + 1)
+            t2 = scanner.get_core_load(i + 1 + 8)
+            ml = max(t1, t2)
+            loads.append(ml)
+            nom, eff = scanner.get_core_freq(i + 1)
+            cs = ratio_to_cstate(eff / nom) if nom > 0 else "C?"
+            cstates.append(cs)
+            if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
+                combined_active += 1
+        state.core_loads = loads
+        state.core_cstates = cstates
+        state.active_cores = combined_active
 
         state.cpu_vids = [
             parse_n(scanner.get_val(f"Core #{i} VID", "V")) for i in range(1, 9)
@@ -1098,10 +1148,6 @@ class MAGIApp(App):
     def action_launch_psnet(self) -> None:
         with self.suspend():
             subprocess.run(["psnet"])
-
-    def action_launch_opencode(self) -> None:
-        with self.suspend():
-            subprocess.run(["opencode", "D:\\tools"])
 
     # ── 警报 ───────────────────────────────────────────────────────────
         
