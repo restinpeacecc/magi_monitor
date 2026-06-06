@@ -1041,8 +1041,8 @@ class MAGIApp(App):
         state.refresh_disk_speed()
 
         # 新增：更新面板临界状态标志
-        # FUSE (Melchior) 的临界判断基于 CPU 温度
-        state.fuse_crit = (state.cpu_temp >= CPU_TEMP_CRITICAL)
+        # FUSE (Melchior) 的临界判断基于 C-State 等级（仅 C0/C1 触发边框闪烁）
+        state.fuse_crit = (state.cpu_cstate_level in ("C0", "C1"))
         # P-STAT (Balthasar) 的临界判断基于总功耗 (与 build_balthasar 中的逻辑一致)
         total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
         state.pstat_crit = (total_pwr >= POWER_CRIT)
