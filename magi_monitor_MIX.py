@@ -79,6 +79,7 @@ class MagiState:
         self.cpu_fan = "0"
         self.cpu_vids: list[float] = [0.0] * 8
         self.cpu_eff_freq: float = 0.0
+        self.cpu_freq_nom: float = 0.0
 
         # GPU
         self.gpu_load = 0.0
@@ -91,6 +92,7 @@ class MagiState:
         self.gpu_mem_junc_temp: float = 0.0
         self.pcie_rx_mbs: float = 0.0
         self.pcie_tx_mbs: float = 0.0
+        self.gpu_pstate: str = "P?"
 
         # 其他
         self.used_p = 0.0
@@ -272,11 +274,16 @@ class MagiState:
                 capture_output=True, text=True, timeout=3
             )
             reasons = {}
+            pstate = "P?"
             for line in r.stdout.splitlines():
                 m = re.search(r":\s*(Active|Not Active)$", line)
                 if m:
                     name = line.split(":")[0].strip()
                     reasons[name] = m.group(1)
+                m_ps = re.search(r"Performance State\s*:\s*(P\d+)", line)
+                if m_ps:
+                    pstate = m_ps.group(1)
+            self.gpu_pstate = pstate
 
             if reasons.get("SW Thermal Slowdown") == "Active" or \
                reasons.get("HW Thermal Slowdown") == "Active":
@@ -295,6 +302,7 @@ class MagiState:
                 self.gpu_status = "STBY"
         except Exception:
             self.gpu_status = "?"
+            self.gpu_pstate = "P?"
 
     # ── 最高 CPU 占用进程 ─────────────────────────────────────
 
@@ -429,16 +437,22 @@ def ratio_to_cstate(ratio: float) -> str:
     if ratio > 0.05: return "C5"
     if ratio > 0.02: return "C6"
     return "C7"
-    try:
-        return float(str(v_str).replace(",", "").split()[0])
-    except Exception:
-        return 0.0
 
 
 def generate_bar(percent, width: int = 15, color: str = "green") -> str:
     p      = max(0.0, min(100.0, float(percent)))
     filled = int(p / 100 * width)
     return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/] {p:>5.1f}%"
+
+
+def build_core_heatmap(loads: list[float]) -> str:
+    cells = []
+    for load in loads:
+        p = max(0.0, min(100.0, load))
+        filled = int(p / 100 * 2)
+        color = "cyan" if p < 25 else "green" if p < 50 else "yellow" if p < 75 else "red1"
+        cells.append(f"[{color}]{'█' * filled}{'░' * (2 - filled)}[/]")
+    return "".join(cells)
 
 
 def get_temp_color(temp_val) -> str:
@@ -568,15 +582,20 @@ def build_melchior() -> Panel:
     else:
         freq_str = "[dim]collecting...[/]"
         
-    # ── C-State 副标题：C-State 分组指示灯（C6|C7/C5|C4/C3|C2/C1|C0） ──
-    _cs = state.cpu_cstate_level
-    if _cs in ("C0", "C1"):
+    # ── FUSE 副标题：在渲染时刻直接用当前功耗+频率判定四级 ──
+    _pwr = state.current_cpu_power
+    _eff = state.cpu_freq_nom
+    if _pwr >= 50 and _eff >= 4700:
+        state.fuse_crit = True
         _sub_color, _sub_freq, _sub_text = "bold red1", 2.5, " CRITICAL "
-    elif _cs in ("C2", "C3"):
+    elif _pwr >= 40 and _eff >= 4400:
+        state.fuse_crit = False
         _sub_color, _sub_freq, _sub_text = "bold gold1", 1, " WARN "
-    elif _cs in ("C4", "C5"):
+    elif _pwr >= 30 and _eff >= 4000:
+        state.fuse_crit = False
         _sub_color, _sub_freq, _sub_text = "bold green", 0.5, " ATTN "
     else:
+        state.fuse_crit = False
         _sub_color, _sub_freq, _sub_text = "cyan", 0, "[reverse] STBL [/reverse]"
     fuse_indicator = blink_markup(_sub_text, _sub_color, _sub_freq)
 
@@ -584,10 +603,11 @@ def build_melchior() -> Panel:
     t.add_column(width=10)
     t.add_row("LOAD",   generate_bar(state.cpu_load, color="orange3"))
     t.add_row("FREQ",  freq_str)
-    t.add_row("TREND",  spark)
+    t.add_row("CORES",  build_core_heatmap(state.core_loads))
     t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.3f} V[/]")
-    t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W[/]")
+    t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
+    t.add_row("TREND",  spark)
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     _active_color = "cyan" if state.active_cores <= 1 else \
                     "green" if state.active_cores <= 4 else \
@@ -597,7 +617,7 @@ def build_melchior() -> Panel:
         f"[bold {_active_color}]{state.active_cores}/8 ACTV[/]"
     )
     
-    # ── 边框逻辑直接在这里决定（不再在 Widget.render() 中后改） ──
+    # ── 边框逻辑：用刚判定的 fuse_crit ──
     flash = state.fuse_crit and state.fuse_blink_on
     border = "bold red" if flash else "orange3"          # 加粗红色
 
@@ -669,6 +689,7 @@ def build_balthasar() -> Panel:
     t.add_row("FREE",   f"[bold green]{state.avail_gb or 'N/A'}[/]")
     t.add_row("NET-DN", net_display) 
     t.add_row("PING",   ping_str)
+    t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
     t.add_row("TCP",    tcp_str) 
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red1"
@@ -722,8 +743,9 @@ def build_casper() -> Panel:
     t.add_row("FREQ",   freq_display)          # 改用趋势显示
     t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="magenta"))
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
-    t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W[/]")
+    t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
+    t.add_row("PCIe",   f"[#7CFC00]▼{state.pcie_rx_mbs:.1f}G[/][dim] | [/][cadet_blue]▲{state.pcie_tx_mbs:.1f}G[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
@@ -917,6 +939,7 @@ class MAGIApp(App):
         if freq_str:
             f_nom = parse_n(freq_str)
             state.add_cpu_freq(f_nom)
+            state.cpu_freq_nom = f_nom
 
         eff_str = scanner.get_val("Cores (Average Effective)", "MHz")
         if eff_str:
@@ -1040,9 +1063,6 @@ class MAGIApp(App):
         # 磁盘速度放在传感器采样后，减小时间偏差
         state.refresh_disk_speed()
 
-        # 新增：更新面板临界状态标志
-        # FUSE (Melchior) 的临界判断基于 C-State 等级（仅 C0/C1 触发边框闪烁）
-        state.fuse_crit = (state.cpu_cstate_level in ("C0", "C1"))
         # P-STAT (Balthasar) 的临界判断基于总功耗 (与 build_balthasar 中的逻辑一致)
         total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
         state.pstat_crit = (total_pwr >= POWER_CRIT)

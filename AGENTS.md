@@ -30,7 +30,7 @@ python magi_monitor_MIX.py
 |-------|-------------|---------|--------|
 | MELCHIOR (CPU) | `MELCHIOR \| N/8 ACTV` | `MELCHIOR \| 6/8 ACTV` | Active core count (load>10% OR freq ratio>0.15), color-coded |
 | BALTHASAR (System) | `BALTHASAR \| {name} {cpu}%` | `BALTHASAR \| chrome 23%` | Top CPU-consuming process (`.exe` stripped, 10 char trunc) |
-| CASPER (GPU) | `CASPER \| {status}` | `CASPER \| STBY` | nvidia-smi Clocks Event Reasons → IDLE/STBY/BOOST/PWR/HOT |
+| CASPER (GPU) | `CASPER \| {status}` | `CASPER \| STBY` | nvidia-smi Clocks Event Reasons → IDLE/STBY/BOOST/PWR/HOT; P-state from `Performance State` field |
 
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
@@ -58,7 +58,9 @@ python magi_monitor_MIX.py
 ## Design Notes
 
 - **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from OHM `Load/CPU Core #i` (with SMT: max of thread 1+9, 2+10, ...) and `Core #i (Effective)` / `Core #i`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
-- **MELCHIOR subtitle shows C-State groups**: `C6|C7` (cyan, reverse, no blink), `C5|C4` (green, 0.5Hz), `C3|C2` (gold, 1Hz), `C1|C0` (red, 2.5Hz). Derived from average effective/nominal frequency ratio.
+- **MELCHIOR subtitle shows power+freq tier**: `CRITICAL` (red flash 2.5Hz, triggers border flash), `WARN` (gold, 1Hz), `ATTN` (green, 0.5Hz), `STBL` (cyan, reverse, no blink). Derived from `current_cpu_power` (Package) and `cpu_freq_nom` (Cores Average). Replaced original C-State group indicator.
+- **MELCHIOR PKG-W shows C-State**: `52.3 W | C0` format, matching CASPER's `TGP | P0` format. Uses original `cpu_cstate_level` from effective/nominal freq ratio.
+- **CASPER TGP shows P-State**: `24.8 W | P0` format. P-State parsed from nvidia-smi `Performance State` field.
 - **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `endswith` for additional safety.
 - **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls the panel border flash (`fuse_crit`). `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications (Toast notify). These serve different UI purposes and should not be unified.
 - **Panel titles are plain text**: After removing the unstable Ollama monitoring feature, panel titles show simple names (MELCHIOR / BALTHASAR / CASPER).
@@ -79,3 +81,11 @@ python magi_monitor_MIX.py
 - GPU status replaces P-State — parses `nvidia-smi` Clocks Event Reasons for IDLE/PWR/HOT/BOOST
 - Top CPU process in BALTHASAR title — `psutil.process_iter(["name", "cpu_percent"])`, filters System Idle Process
 - Crash recovery log (`logs/crash_log.csv`) — 1s interval, 30min rolling window, 512KB cap, silent failure
+- GPU P-State added — parses `Performance State` from nvidia-smi output, displayed in CASPER TGP row as `W | P0`
+- MELCHIOR subtitle changed — from C-State groups to power+freq tier (CRITICAL/WARN/ATTN/STBL), computed at render time in `build_melchior()`
+- PKG-W row format unified with TGP — shows `W | C0` matching `W | P0` on CASPER
+- `cpu_freq_nom` field added — uses "Cores (Average)" sensor for tier threshold (avoids effective freq averaging issue with idle cores)
+- `build_core_heatmap()` added — per-core load heatmap in MELCHIOR panel, 8 chars, 3-level threshold per core
+- Memory Temp added to BALTHASAR — `state.mem_temp` displayed with dynamic color matching other TEMP rows
+- PCIe Rx/Tx added to CASPER — `state.pcie_rx_mbs` / `state.pcie_tx_mbs` shown in a new row
+- Dead code removed — orphaned `try/return float` after `ratio_to_cstate()` cleaned up

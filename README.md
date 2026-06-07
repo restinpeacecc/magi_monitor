@@ -9,9 +9,9 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 ## ✨ 主要特性
 
 - **三贤者面板**：
-  - **MELCHIOR**: CPU 监控，标题栏显示活跃核心数 `N/8 ACTV` + C-State 分组指示（C6|C7/C5|C4/C3|C2/C1|C0），热余量副标题指示灯
-  - **BALTHASAR**: 系统状态，标题栏显示最高 CPU 占用进程 + 功耗状态灯
-  - **CASPER**: GPU 监控，标题栏显示 nvidia-smi Clocks Event Reasons
+- **MELCHIOR**: CPU 监控，标题栏显示活跃核心数 `N/8 ACTV` + 功率/频率四级热余量指示灯（CRITICAL/WARN/ATTN/STBL）
+- **BALTHASAR**: 系统状态，标题栏显示最高 CPU 占用进程 + 功耗状态灯
+- **CASPER**: GPU 监控，标题栏显示 nvidia-smi Clocks Event Reasons + 性能状态 P-State
 
 - **实时监控**：CPU/GPU 负载、频率、温度、电压、功耗、C-State、GPU 电压/显存结温、PCIe 带宽、VRAM 使用率、+3.3V/Vcore 电压轨
 - **每核 C-State 追踪**：基于有效频率/标称频率比推断 8 核独立 C-State
@@ -86,12 +86,13 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 
 ### MELCHIOR (CPU)
 - **标题**: `MELCHIOR | N/8 ACTV`，活跃核心数颜色编码（0~1 青色、2~4 绿色、5~6 黄色、7~8 红色）
-- **副标题**: C-State 分组指示灯（C6|C7 青/reverse、C5|C4 绿闪、C3|C2 金闪、C1|C0 红闪）
+- **副标题**: 功率+频率四级指示灯（CRITICAL 红闪 2.5Hz / WARN 金闪 1Hz / ATTN 绿闪 0.5Hz / STBL 青 reverse）
 - LOAD: CPU 使用率进度条
 - FREQ: 频率 + 趋势箭头 + 最小/最大值
 - TREND: Braille 频率曲线
 - V-AVG: 平均 VID 电压
-- PKG-W: CPU 封装功耗
+- CORES: 8 核热点图（每核 1 字符，`█` >50% / `░` ≤50%，颜色四级）
+- PKG-W: CPU 封装功耗 + C-State
 - TEMP: CPU 温度（颜色编码）
 - FAN: CPU 风扇转速
 
@@ -103,6 +104,7 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 - NET-DN: 当前下载速度 @ 历史最大
 - PING: 网络延迟（颜色编码）
 - TCP: EST/TW 连接数
+- MEMTMP: 内存温度（颜色编码，与 CPU/GPU 温度行对齐）
 - DISK: 磁盘读写速度
 - POWER: 整机估算功耗（CPU+GPU+基础偏移）
 
@@ -113,8 +115,9 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 - FREQ: 核心频率 + 趋势箭头
 - VRAM: 显存使用率进度条
 - VCORE: GPU 电压
-- TGP: GPU 封装功耗
+- TGP: GPU 封装功耗 + P-State
 - TEMP: GPU 温度
+- PCIe: PCIe 接收/发送速率
 - FAN: 风扇转速
 
 ## 🎨 视觉风格
