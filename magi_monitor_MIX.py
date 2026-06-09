@@ -104,6 +104,11 @@ class MagiState:
         self.weather: str          = "LOADING..."
         self.last_weather_update: float = 0.0
 
+        # Swap
+        self.swap_pct: float = 0.0
+        self.swap_used_gb: float = 0.0
+        self.swap_total_gb: float = 0.0
+
         self.alert_level = 0           # 0:正常, 1:警告, 2:危险
         self.last_alert_time = 0.0     # 防止重复通知
 
@@ -249,6 +254,17 @@ class MagiState:
             self.disk_w = 0.0
         self._last_disk_io = now_io
         self._last_time    = now_time
+
+    # ── Swap ─────────────────────────────────────────────────────────────────
+
+    def update_swap(self):
+        try:
+            s = psutil.swap_memory()
+            self.swap_pct = s.percent
+            self.swap_used_gb = s.used / (1024**3)
+            self.swap_total_gb = s.total / (1024**3)
+        except Exception:
+            pass
 
     # ── 天气（每30分钟更新一次）──────────────────────────────────────────────────
 
@@ -661,9 +677,9 @@ def build_balthasar() -> Panel:
             max_str = f"{max_kbps / 1024:.1f} MB/s"
         else:
             max_str = f"{max_kbps:.0f} KB/s"
-        net_display = f"[yellow]▼{net_cur}[/]@[dim]{max_str}[/]"
+        net_display = f"[gold1]▼{net_cur}[/]@[dim]{max_str}[/]"
     else:
-        net_display = f"[yellow]▼{net_cur}[/]"
+        net_display = f"[gold1]▼{net_cur}[/]"
     
     p = state.ping_ms
     if p == -2.0:
@@ -674,7 +690,7 @@ def build_balthasar() -> Panel:
         color = "cyan" if p < 30 else "yellow" if p < 80 else "red"
         ping_str = f"[{color}]{p:.0f} ms[/]"
 
-    tcp_str = f"[#7CFC00]EST:{state.tcp_established}[/] [dim]|[/] [cadet_blue]TW:{state.tcp_timewait}[/]"
+    tcp_str = f"[#7CFC00]EST:{state.tcp_established}[/] [dim]|[/] [yellow]TW:{state.tcp_timewait}[/]"
 
     # 整机估算功耗
     total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
@@ -685,8 +701,10 @@ def build_balthasar() -> Panel:
     t = Table.grid(padding=0)
     t.add_column(width=10)
     t.add_row("MEMORY", generate_bar(state.used_p, color="bright_blue"))
-    t.add_row("USED",   f"[bold red]{state.used_gb or 'N/A'}[/]")
-    t.add_row("FREE",   f"[bold green]{state.avail_gb or 'N/A'}[/]")
+    _avail = parse_n(state.avail_gb)
+    _free_color = "green" if _avail > 15 else "yellow" if _avail > 10 else "red1"
+    t.add_row("FREE",   f"[bold {_free_color}]{state.avail_gb or 'N/A'}[/]")
+    t.add_row("SWAP",   generate_bar(state.swap_pct, color="magenta"))
     t.add_row("NET-DN", net_display) 
     t.add_row("PING",   ping_str)
     t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
@@ -741,11 +759,11 @@ def build_casper() -> Panel:
     t.add_column(width=10)
     t.add_row("LOAD",   generate_bar(state.gpu_load, color="red"))
     t.add_row("FREQ",   freq_display)          # 改用趋势显示
-    t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="magenta"))
+    t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="#4a00f7"))
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
-    t.add_row("PCIe",   f"[#7CFC00]▼{state.pcie_rx_mbs:.1f}G[/][dim] | [/][cadet_blue]▲{state.pcie_tx_mbs:.1f}G[/]")
+    t.add_row("PCIe",   f"[#7CFC00]▼{state.pcie_rx_mbs:.1f}G[/][dim] | [/][yellow]▲{state.pcie_tx_mbs:.1f}G[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
@@ -1076,6 +1094,7 @@ class MAGIApp(App):
         """独立运行的慢速任务，不影响传感器刷新率"""
         state.update_gpu_status()
         state.update_top_process()
+        state.update_swap()
         state.update_ping()
         state.update_weather()  # HTTP (wttr.in) 每30分钟更新
         state.update_tcp_counts()

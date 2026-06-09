@@ -89,3 +89,4 @@ python magi_monitor_MIX.py
 - Memory Temp added to BALTHASAR — `state.mem_temp` displayed with dynamic color matching other TEMP rows
 - PCIe Rx/Tx added to CASPER — `state.pcie_rx_mbs` / `state.pcie_tx_mbs` shown in a new row
 - Dead code removed — orphaned `try/return float` after `ratio_to_cstate()` cleaned up
+- FREE 行颜色编码 — 可用内存 >15G green, >10G yellow, ≤10G red1，使用 `parse_n()` 安全解析含单位的字符串
