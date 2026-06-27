@@ -10,6 +10,7 @@ import re
 import subprocess
 import time
 import threading
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,21 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Static, Label
 from textual.screen import Screen
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+from pynvml import (
+    nvmlInit, nvmlDeviceGetHandleByIndex,
+    nvmlDeviceGetPerformanceState,
+    nvmlDeviceGetCurrentClocksEventReasons,
+    nvmlDeviceGetUtilizationRates,
+    nvmlDeviceGetEncoderUtilization,
+    nvmlDeviceGetDecoderUtilization,
+    nvmlClocksEventReasonGpuIdle,
+    nvmlClocksEventReasonSwThermalSlowdown,
+    nvmlClocksEventReasonHwThermalSlowdown,
+    nvmlClocksEventReasonSwPowerCap,
+    nvmlClocksEventReasonHwPowerBrakeSlowdown,
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  常量
@@ -57,7 +73,7 @@ LOG_COLUMNS = [
     "pcie_rx","pcie_tx",
     "v3v3","vcore_v",
     "top_proc","top_cpu",
-    "gpu_decoder_util","gpu_encoder_util","gpu_mem_util","gpu_recovery_action"
+    "gpu_decoder_util","gpu_encoder_util","gpu_mem_util","gpu_clk_reasons"
 ]
 
 
@@ -130,16 +146,22 @@ class MagiState:
         # C-State / GPU 状态 / 最高 CPU 进程
         self.cpu_cstate_level: str = "C?"
         self.gpu_status: str = "?"
-        self._last_gpu_status_update: float = 0.0
         self.top_proc_name: str = ""
         self.top_proc_cpu: float = 0.0
 
-        # GPU 诊断（引擎利用率、Recovery Action）
+        # GPU 诊断（引擎利用率、板卡功耗墙）
         self.gpu_decoder_util: float = 0.0
         self.gpu_encoder_util: float = 0.0
         self.gpu_mem_util: float = 0.0
-        self.gpu_recovery_action: str = "None"
-        self._last_gpu_diag_update: float = 0.0
+        self.gpu_clk_reasons: int = 0
+
+        # NVML 初始化
+        self._nvml_handle = None
+        try:
+            nvmlInit()
+            self._nvml_handle = nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            pass
 
         # 每核负载 / 每核 C-State / 活跃核心数（7800X3D = 8 物理核，16 逻辑线程）
         self.core_loads: list[float] = [0.0] * 8
@@ -285,72 +307,43 @@ class MagiState:
             except Exception:
                 self.weather = "OFFLINE"
 
-    # ── GPU 运行状态（基于 nvidia-smi Clocks Event Reasons） ──
+    # ── GPU 运行状态/诊断（pynvml 直调，无子进程） ──
 
-    def update_gpu_status(self):
-        now = time.time()
-        if now - self._last_gpu_status_update < 1:
+    def _update_gpu_nvml(self):
+        if self._nvml_handle is None:
             return
-        self._last_gpu_status_update = now
         try:
-            r = subprocess.run(
-                ["nvidia-smi", "-q", "-d", "PERFORMANCE"],
-                capture_output=True, text=True, timeout=3
-            )
-            reasons = {}
-            pstate = "P?"
-            for line in r.stdout.splitlines():
-                m = re.search(r":\s*(Active|Not Active)$", line)
-                if m:
-                    name = line.split(":")[0].strip()
-                    reasons[name] = m.group(1)
-                m_ps = re.search(r"Performance State\s*:\s*(P\d+)", line)
-                if m_ps:
-                    pstate = m_ps.group(1)
-            self.gpu_pstate = pstate
+            h = self._nvml_handle
+            reasons = nvmlDeviceGetCurrentClocksEventReasons(h)
+            ps = nvmlDeviceGetPerformanceState(h)
+            self.gpu_pstate = f"P{ps}"
 
-            if reasons.get("SW Thermal Slowdown") == "Active" or \
-               reasons.get("HW Thermal Slowdown") == "Active":
+            if reasons & nvmlClocksEventReasonSwThermalSlowdown \
+               or reasons & nvmlClocksEventReasonHwThermalSlowdown:
                 self.gpu_status = "THR"
-            elif reasons.get("SW Power Cap") == "Active" or \
-                 reasons.get("HW Power Brake Slowdown") == "Active":
+            elif reasons & nvmlClocksEventReasonSwPowerCap \
+                 or reasons & nvmlClocksEventReasonHwPowerBrakeSlowdown:
                 self.gpu_status = "PWR"
-            elif reasons.get("Idle") == "Active":
+            elif reasons & nvmlClocksEventReasonGpuIdle:
                 self.gpu_status = "STBY"
-            elif self.gpu_load >= 30 and \
-                 all(v == "Not Active" for v in reasons.values()):
+            elif self.gpu_load >= 30 and reasons == 0:
                 self.gpu_status = "BOOST"
             elif self.gpu_load >= 10:
                 self.gpu_status = "NORM"
             else:
                 self.gpu_status = "STBY"
+
+            dec, _ = nvmlDeviceGetDecoderUtilization(h)
+            enc, _ = nvmlDeviceGetEncoderUtilization(h)
+            mem_util = nvmlDeviceGetUtilizationRates(h).memory
+            self.gpu_decoder_util = float(dec)
+            self.gpu_encoder_util = float(enc)
+            self.gpu_mem_util = float(mem_util)
+
+            self.gpu_clk_reasons = reasons
         except Exception:
             self.gpu_status = "?"
             self.gpu_pstate = "P?"
-
-    # ── GPU 诊断（引擎利用率、Recovery Action） ──
-
-    def update_gpu_diagnostics(self):
-        now = time.time()
-        if now - self._last_gpu_diag_update < 1:
-            return
-        self._last_gpu_diag_update = now
-        try:
-            r = subprocess.run(
-                ["nvidia-smi",
-                 "--query-gpu=utilization.decoder,utilization.encoder,utilization.memory,"
-                 "gpu_recovery_action",
-                 "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5
-            )
-            parts = [p.strip() for p in r.stdout.strip().split(",")]
-            if len(parts) >= 4:
-                self.gpu_decoder_util = parse_n(parts[0].replace("%", ""))
-                self.gpu_encoder_util = parse_n(parts[1].replace("%", ""))
-                self.gpu_mem_util = parse_n(parts[2].replace("%", ""))
-                self.gpu_recovery_action = parts[3]
-        except Exception:
-            pass
 
     def update_top_process(self):
         try:
@@ -1122,9 +1115,8 @@ class MAGIApp(App):
 
     @work(thread=True, exclusive=True)
     def _collect_gpu(self) -> None:
-        """1s tick：GPU 状态/诊断（NVML 只读查询，无副作用）"""
-        state.update_gpu_status()
-        state.update_gpu_diagnostics()
+        """1s tick：GPU 状态/诊断（pynvml 直调，无子进程）"""
+        state._update_gpu_nvml()
 
     def _collect_slow_tasks(self) -> None:
         """5s tick：Ping/TCP/进程/天气——保持低频"""
@@ -1187,7 +1179,7 @@ class MAGIApp(App):
                 f"{s.v3v3:.3f},{s.vcore_v:.3f},"
                 f"{s.top_proc_name},{s.top_proc_cpu:.0f},"
                 f"{s.gpu_decoder_util:.0f},{s.gpu_encoder_util:.0f},{s.gpu_mem_util:.0f},"
-                f"{s.gpu_recovery_action}\n"
+                f"{s.gpu_clk_reasons}\n"
             )
             exists = log_path.exists()
             with log_path.open("a", encoding="utf-8", newline="") as f:

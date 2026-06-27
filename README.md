@@ -11,7 +11,7 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 - **三贤者面板**：
 - **MELCHIOR**: CPU 监控，标题栏显示活跃核心数 `N/8 ACTV` + 功率/频率四级热余量指示灯（CRITICAL/WARN/ATTN/STBL）
 - **BALTHASAR**: 系统状态，标题栏显示最高 CPU 占用进程 + 功耗状态灯
-- **CASPER**: GPU 监控，标题栏显示 nvidia-smi Clocks Event Reasons + 性能状态 P-State
+- **CASPER**: GPU 监控，标题栏显示 pynvml Clocks Event Reasons + 性能状态 P-State
 
 - **实时监控**：CPU/GPU 负载、频率、温度、电压、功耗、C-State、GPU 电压/显存结温、PCIe 带宽、VRAM 使用率、+3.3V/Vcore 电压轨
 - **每核 C-State 追踪**：基于有效频率/标称频率比推断 8 核独立 C-State
@@ -23,7 +23,7 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 ## 🚀 安装依赖
 
 ```bash
-pip install textual rich psutil requests
+pip install textual rich psutil requests nvidia-ml-py
 ```
 
 ## ▶️ 运行
@@ -63,7 +63,7 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 ### 外部依赖
 
 - **LibreHardwareMonitor / OpenHardwareMonitor**: 本地 8085 端口 JSON API
-- **nvidia-smi**: GPU 状态查询（Clocks Event Reasons）
+- **pynvml (nvidia-ml-py)**: GPU 状态查询（Clocks Event Reasons，直调 nvml.dll）
 - **wttr.in**: 天气（可选，离线显示 OFFLINE）
 
 ## 🏗️ 架构概览
@@ -73,7 +73,7 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 | 定时器 | 周期 | 执行者 | 任务 |
 |--------|------|--------|------|
 | `_tick` | **0.2s** | `@work(thread, exclusive)` | OHM 轮询、psutil、频率历史、警报 |
-| `_collect_gpu` | **1s** | `@work(thread, exclusive)` | nvidia-smi GPU 状态 + 诊断（解码器/编码器/显存利用率） |
+| `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU 状态 + 诊断（解码器/编码器/显存利用率） |
 | `_log_tick` | **1s** | 主线程 | CSV 日志追加 (文件 I/O <1ms) |
 | `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top 进程、ping、天气、TCP、swap |
 
@@ -131,7 +131,7 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 
 ## 📝 崩溃恢复日志
 
-- **文件**: `logs/crash_log.csv`（31 列）
+- **文件**: `logs/crash_log.csv`（36 列）
 - **周期**: 每秒追加
 - **窗口**: 启动时裁剪到最近 30 分钟
 - **封顶**: 512KB，超出时保留前半行数
@@ -157,7 +157,7 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 - Evangelion 系列作品启发
 - Textual 社区支持
 - LibreHardwareMonitor 项目
-- NVIDIA nvidia-smi 工具
+- NVIDIA NVML / pynvml 库
 
 ---
 
