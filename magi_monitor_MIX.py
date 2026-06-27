@@ -53,10 +53,11 @@ LOG_COLUMNS = [
     "time","cpu_load","cpu_temp","cpu_pkg_w","cpu_eff_freq","cstate","cpu_fan",
     "cpu_vid1","cpu_vid2","cpu_vid3","cpu_vid4","cpu_vid5","cpu_vid6","cpu_vid7","cpu_vid8",
     "mem_pct","mem_temp",
-    "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status",
+    "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status","gpu_pstate",
     "pcie_rx","pcie_tx",
     "v3v3","vcore_v",
-    "top_proc","top_cpu"
+    "top_proc","top_cpu",
+    "gpu_decoder_util","gpu_encoder_util","gpu_mem_util","gpu_recovery_action"
 ]
 
 
@@ -132,6 +133,13 @@ class MagiState:
         self._last_gpu_status_update: float = 0.0
         self.top_proc_name: str = ""
         self.top_proc_cpu: float = 0.0
+
+        # GPU 诊断（引擎利用率、Recovery Action）
+        self.gpu_decoder_util: float = 0.0
+        self.gpu_encoder_util: float = 0.0
+        self.gpu_mem_util: float = 0.0
+        self.gpu_recovery_action: str = "None"
+        self._last_gpu_diag_update: float = 0.0
 
         # 每核负载 / 每核 C-State / 活跃核心数（7800X3D = 8 物理核，16 逻辑线程）
         self.core_loads: list[float] = [0.0] * 8
@@ -281,7 +289,7 @@ class MagiState:
 
     def update_gpu_status(self):
         now = time.time()
-        if now - self._last_gpu_status_update < 5:
+        if now - self._last_gpu_status_update < 1:
             return
         self._last_gpu_status_update = now
         try:
@@ -320,7 +328,29 @@ class MagiState:
             self.gpu_status = "?"
             self.gpu_pstate = "P?"
 
-    # ── 最高 CPU 占用进程 ─────────────────────────────────────
+    # ── GPU 诊断（引擎利用率、Recovery Action） ──
+
+    def update_gpu_diagnostics(self):
+        now = time.time()
+        if now - self._last_gpu_diag_update < 1:
+            return
+        self._last_gpu_diag_update = now
+        try:
+            r = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=utilization.decoder,utilization.encoder,utilization.memory,"
+                 "gpu_recovery_action",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5
+            )
+            parts = [p.strip() for p in r.stdout.strip().split(",")]
+            if len(parts) >= 4:
+                self.gpu_decoder_util = parse_n(parts[0].replace("%", ""))
+                self.gpu_encoder_util = parse_n(parts[1].replace("%", ""))
+                self.gpu_mem_util = parse_n(parts[2].replace("%", ""))
+                self.gpu_recovery_action = parts[3]
+        except Exception:
+            pass
 
     def update_top_process(self):
         try:
@@ -562,10 +592,10 @@ def build_header() -> Panel:
     hostname = _platform.node().split(".")[0]
     date_str = datetime.now().strftime("%m/%d (%a)")
     txt = (
-        f"[bold green]MAGI SYSTEM[/] [dim]||[/] {now} "
-        f"[dim]||[/] [bold red]UP: {uptime}[/] [dim]||[/] "
+        f"[bold green]MAGI SYSTEM[/] [dim]||[/][orange3] {date_str} [/]"
+        f"[dim]||[/][orange3] {now} [/][dim]||[/] "
         f"{state.weather} [dim]||[/] "
-        f"[bold yellow]{hostname}[/] [dim]|[/] {date_str}"
+        f"[bold green]{hostname}[/] [dim]||[/] [bold red]UP: {uptime}[/]"
     )
     return Panel(Align.center(txt), border_style="orange3")
 
@@ -690,7 +720,7 @@ def build_balthasar() -> Panel:
         color = "cyan" if p < 30 else "yellow" if p < 80 else "red"
         ping_str = f"[{color}]{p:.0f} ms[/]"
 
-    tcp_str = f"[#7CFC00]EST:{state.tcp_established}[/] [dim]|[/] [yellow]TW:{state.tcp_timewait}[/]"
+    tcp_str = f"[#7CFC00]EST:{state.tcp_established}[/] [dim]|[/] [#FFE4B5]TW:{state.tcp_timewait}[/]"
 
     # 整机估算功耗
     total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
@@ -763,7 +793,7 @@ def build_casper() -> Panel:
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
-    t.add_row("PCIe",   f"[#7CFC00]▼{state.pcie_rx_mbs:.1f}G[/][dim] | [/][yellow]▲{state.pcie_tx_mbs:.1f}G[/]")
+    t.add_row("PCIe",   f"[#7CFC00]▼{state.pcie_rx_mbs:.1f}G[/][dim] | [/][#FFE4B5]▲{state.pcie_tx_mbs:.1f}G[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
@@ -920,9 +950,10 @@ class MAGIApp(App):
             self.query_one(BalthasarPanel),
             self.query_one(CasperPanel),
         ]
-        self.set_interval(0.2, self._tick)     # 高频：传感器（0.2s）
-        self.set_interval(5.0, self._collect_slow_tasks) # 低频：Ping/TCP/GPU状态
-        self.set_interval(1.0, self._log_tick) # 日志写入（1s）
+        self.set_interval(0.2, self._tick)        # 高频：传感器（0.2s）
+        self.set_interval(1.0, self._collect_gpu) # 1s：GPU状态/NVML
+        self.set_interval(5.0, self._collect_slow_tasks) # 5s：Ping/TCP/进程
+        self.set_interval(1.0, self._log_tick)    # 日志写入（1s）
 
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
@@ -1090,9 +1121,13 @@ class MAGIApp(App):
         # 不再在此处调用 _check_alert 和 _refresh_all，改由 _tick 处理
 
     @work(thread=True, exclusive=True)
-    def _collect_slow_tasks(self) -> None:
-        """独立运行的慢速任务，不影响传感器刷新率"""
+    def _collect_gpu(self) -> None:
+        """1s tick：GPU 状态/诊断（NVML 只读查询，无副作用）"""
         state.update_gpu_status()
+        state.update_gpu_diagnostics()
+
+    def _collect_slow_tasks(self) -> None:
+        """5s tick：Ping/TCP/进程/天气——保持低频"""
         state.update_top_process()
         state.update_swap()
         state.update_ping()
@@ -1147,10 +1182,12 @@ class MAGIApp(App):
                 f"{s.used_p:.1f},{s.mem_temp:.1f},"
                 f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
                 f"{s.current_gpu_power:.1f},{s.gpu_freq_history[-1] if s.gpu_freq_history else 0:.0f},"
-                f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},"
+                f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},{s.gpu_pstate},"
                 f"{s.pcie_rx_mbs:.1f},{s.pcie_tx_mbs:.1f},"
                 f"{s.v3v3:.3f},{s.vcore_v:.3f},"
-                f"{s.top_proc_name},{s.top_proc_cpu:.0f}\n"
+                f"{s.top_proc_name},{s.top_proc_cpu:.0f},"
+                f"{s.gpu_decoder_util:.0f},{s.gpu_encoder_util:.0f},{s.gpu_mem_util:.0f},"
+                f"{s.gpu_recovery_action}\n"
             )
             exists = log_path.exists()
             with log_path.open("a", encoding="utf-8", newline="") as f:

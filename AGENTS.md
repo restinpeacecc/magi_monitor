@@ -10,17 +10,18 @@ python magi_monitor_MIX.py
 
 - Single-file Textual TUI app (`magi_monitor_MIX.py`), entry point: `MAGIApp().run()`
 - Reads hardware sensors from **OpenHardwareMonitor / LibreHardwareMonitor** JSON API at `http://localhost:8085/data.json` via `MAGIScanner`
-- GPU status via `nvidia-smi -q -d PERFORMANCE` (Clocks Event Reasons → IDLE/PWR/HOT/BOOST)
+- GPU status via `nvidia-smi -q -d PERFORMANCE` (Clocks Event Reasons → IDLE/PWR/HOT/BOOST), polled every 1s
 - Requires `psutil` and `requests` (no `pyproject.toml` / `requirements.txt` — install manually)
 - No test suite, no lint/typecheck config
 
-## Three-Tier Threading Model
+## Four-Tier Timer Model
 
 | Timer | Period | Worker | Tasks |
 |-------|--------|--------|-------|
 | `_tick` | **0.2s** | `@work(thread, exclusive)` | OHM sensor polling, psutil, freq history, alerts |
+| `_collect_gpu` | **1s** | `@work(thread, exclusive)` | nvidia-smi GPU status (`-q -d PERFORMANCE`) + diagnostics (decoder/encoder/mem util) |
 | `_log_tick` | **1s** | Main thread | CSV log append (file I/O < 1ms) |
-| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | nvidia-smi GPU status, top CPU process, ping, weather, TCP |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, ping, weather, TCP, swap |
 
 - **State (`MagiState`) is shared between threads without locks** on scalar fields. Only the freq history lists are protected by `_list_lock`. When modifying state fields, be aware of potential data races.
 
@@ -35,7 +36,7 @@ python magi_monitor_MIX.py
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
 - **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
-- **Columns** (31 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vid1~8,mem_pct,mem_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,pcie_rx,pcie_tx,v3v3,vcore_v,top_proc,top_cpu`
+- **Columns** (32 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vid1~8,mem_pct,mem_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,pcie_rx,pcie_tx,v3v3,vcore_v,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_recovery_action`
 - **Writing**: `_log_tick()` every 1s, simple `open+append` on main thread
 - **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)
 - **Size cap**: `LOG_MAX_BYTES = 512KB` → auto trims to half when exceeded
@@ -90,3 +91,4 @@ python magi_monitor_MIX.py
 - PCIe Rx/Tx added to CASPER — `state.pcie_rx_mbs` / `state.pcie_tx_mbs` shown in a new row
 - Dead code removed — orphaned `try/return float` after `ratio_to_cstate()` cleaned up
 - FREE 行颜色编码 — 可用内存 >15G green, >10G yellow, ≤10G red1，使用 `parse_n()` 安全解析含单位的字符串
+- GPU polling 从 5s 改为 1s — 新增 `_collect_gpu` 定时器，与原 `_collect_slow_tasks` 拆离，避免 ping/TCP/进程枚举等被连带加速

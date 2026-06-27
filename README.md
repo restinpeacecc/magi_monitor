@@ -68,13 +68,14 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 
 ## 🏗️ 架构概览
 
-### 三阶线程模型
+### 四阶线程模型
 
 | 定时器 | 周期 | 执行者 | 任务 |
 |--------|------|--------|------|
 | `_tick` | **0.2s** | `@work(thread, exclusive)` | OHM 轮询、psutil、频率历史、警报 |
+| `_collect_gpu` | **1s** | `@work(thread, exclusive)` | nvidia-smi GPU 状态 + 诊断（解码器/编码器/显存利用率） |
 | `_log_tick` | **1s** | 主线程 | CSV 日志追加 (文件 I/O <1ms) |
-| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | nvidia-smi、top 进程、ping、天气、TCP |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top 进程、ping、天气、TCP、swap |
 
 ### 核心类
 
