@@ -63,6 +63,7 @@ python magi_monitor_MIX.py
 - **MELCHIOR PKG-W shows C-State**: `52.3 W | C0` format, matching CASPER's `TGP | P0` format. Uses original `cpu_cstate_level` from effective/nominal freq ratio.
 - **CASPER TGP shows P-State**: `24.8 W | P0` format. P-State parsed from NVML `Performance State` field.
 - **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `endswith` for additional safety.
+- **iGPU 共存时用 `hw_contains` 过滤**：`get_val()` 支持 `hw_contains` 参数，GPU 查询传入 `"nvidia"` 确保独显传感器不被 iGPU 同名传感器干扰。所有 GPU OHM 查询统一使用此过滤。
 - **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls the panel border flash (`fuse_crit`). `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications (Toast notify). These serve different UI purposes and should not be unified.
 - **Panel titles are plain text**: After removing the unstable Ollama monitoring feature, panel titles show simple names (MELCHIOR / BALTHASAR / CASPER).
 
@@ -93,3 +94,4 @@ python magi_monitor_MIX.py
 - FREE 行颜色编码 — 可用内存 >15G green, >10G yellow, ≤10G red1，使用 `parse_n()` 安全解析含单位的字符串
 - GPU polling 从 5s 改为 1s — 新增 `_collect_gpu` 定时器，与原 `_collect_slow_tasks` 拆离，避免 ping/TCP/进程枚举等被连带加速
 - **nvidia-smi 子进程 → pynvml 直调** — 移除两个 `subprocess.run(["nvidia-smi", ...])`，改用 pynvml 直接绑定 `nvml.dll`（无子进程，无 stdout 解析）；OHM(NVAPI) 的 GPU 传感器不动，保留崩溃时数据存活能力；`gpu_recovery_action` 替换为 `gpu_clk_reasons`（Clocks Event Reasons 原始 bitmask）
+- **iGPU 共存 OHM 传感器过滤** — CPU 启用集成显卡后，OHM 同时报告 iGPU + dGPU 同名传感器（GPU Core/MHz/°C 等），`get_val()` 新增 `hw_contains` 参数，所有 GPU 查询传入 `"nvidia"` 确保读取独显数据

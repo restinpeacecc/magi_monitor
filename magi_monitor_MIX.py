@@ -413,10 +413,13 @@ class MAGIScanner:
         for child in node.get("Children", []):
             self._walk(child, hw)
 
-    def get_val(self, name_target: str, unit_target: str | None = None) -> str | None:
-        """末尾锚定匹配，避免子串误中（'Cores (Average)' vs 'Cores (Average Effective)' / 'Core #1' vs 'Core #10'）"""
+    def get_val(self, name_target: str, unit_target: str | None = None,
+                hw_contains: str | None = None) -> str | None:
+        """末尾锚定匹配，hw_contains 过滤硬件名（如 'nvidia' 排除 iGPU）"""
         pattern = re.compile(r"(?:^|\W)" + re.escape(name_target.lower()) + r"$")
         for name_lower, val in self._cache:
+            if hw_contains and hw_contains.lower() not in name_lower:
+                continue
             if pattern.search(name_lower):
                 if unit_target is None or unit_target.lower() in val.lower():
                     return val
@@ -1027,41 +1030,41 @@ class MAGIApp(App):
         fan_cpu = scanner.get_val("Fan #2", "RPM")
         if fan_cpu: state.cpu_fan = fan_cpu
 
-        # GPU数据采样
-        gpu_load_val = scanner.get_val("GPU Core", "%")
+        # GPU数据采样（hw_contains="nvidia" 排除 iGPU 传感器）
+        gpu_load_val = scanner.get_val("GPU Core", "%", hw_contains="nvidia")
         if gpu_load_val is not None: state.gpu_load = parse_n(gpu_load_val)
         
-        gpu_freq_str = scanner.get_val("GPU Core", "MHz")
+        gpu_freq_str = scanner.get_val("GPU Core", "MHz", hw_contains="nvidia")
         if gpu_freq_str:
             state.add_gpu_freq(parse_n(gpu_freq_str))
 
-        v_used = parse_n(scanner.get_val("GPU Memory Used", "MB"))
-        v_total = parse_n(scanner.get_val("GPU Memory Total", "MB"))
+        v_used = parse_n(scanner.get_val("GPU Memory Used", "MB", hw_contains="nvidia"))
+        v_total = parse_n(scanner.get_val("GPU Memory Total", "MB", hw_contains="nvidia"))
         state.vram_used_pct = (v_used / v_total * 100) if v_total > 0 else 0.0
 
-        gpu_volt_val = scanner.get_val("GPU Core Voltage", "V")
+        gpu_volt_val = scanner.get_val("GPU Core Voltage", "V", hw_contains="nvidia")
         if gpu_volt_val is not None: state.gpu_volt = parse_n(gpu_volt_val)
 
-        gpu_p_raw = scanner.get_val("GPU Package", "W")
+        gpu_p_raw = scanner.get_val("GPU Package", "W", hw_contains="nvidia")
         if gpu_p_raw is not None:
             state.current_gpu_power = parse_n(gpu_p_raw)
             
-        gpu_temp_val = scanner.get_val("GPU Core", "°C")
+        gpu_temp_val = scanner.get_val("GPU Core", "°C", hw_contains="nvidia")
         if gpu_temp_val is not None:
             state.gpu_temp = parse_n(gpu_temp_val)
 
-        mem_junc = scanner.get_val("GPU Memory Junction", "°C")
+        mem_junc = scanner.get_val("GPU Memory Junction", "°C", hw_contains="nvidia")
         if mem_junc is not None:
             state.gpu_mem_junc_temp = parse_n(mem_junc)
 
-        pcie_rx = scanner.get_val("GPU PCIe Rx")
+        pcie_rx = scanner.get_val("GPU PCIe Rx", hw_contains="nvidia")
         if pcie_rx:
             state.pcie_rx_mbs = parse_n(pcie_rx)
-        pcie_tx = scanner.get_val("GPU PCIe Tx")
+        pcie_tx = scanner.get_val("GPU PCIe Tx", hw_contains="nvidia")
         if pcie_tx:
             state.pcie_tx_mbs = parse_n(pcie_tx)
 
-        fan_gpu = scanner.get_val("GPU Fan", "RPM")
+        fan_gpu = scanner.get_val("GPU Fan", "RPM", hw_contains="nvidia")
         if fan_gpu: state.gpu_fan = fan_gpu
 
         # 其他数据

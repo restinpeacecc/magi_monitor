@@ -60,6 +60,11 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
     combined_active += 1
 ```
 
+### iGPU 共存
+
+CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器（`GPU Core`、`GPU Core Voltage` 等）。
+`MAGIScanner.get_val()` 通过 `hw_contains="nvidia"` 参数确保所有 GPU OHM 查询只匹配独显传感器。
+
 ### 外部依赖
 
 - **LibreHardwareMonitor / OpenHardwareMonitor**: 本地 8085 端口 JSON API
@@ -80,7 +85,7 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 ### 核心类
 
 - **`MagiState`**: 线程安全的共享状态（标量无锁，历史列表由 `_list_lock` 保护）
-- **`MAGIScanner`**: OHM JSON API 传感器数据采集
+- **`MAGIScanner`**: OHM JSON API 传感器数据采集（支持 `hw_contains` 过滤，GPU 查询传入 `"nvidia"` 排除 iGPU 同名传感器干扰）
 - **`MAGIApp`**: Textual 主应用
 
 ## 📊 面板说明
