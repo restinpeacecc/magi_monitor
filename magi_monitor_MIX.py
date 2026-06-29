@@ -85,6 +85,7 @@ class MagiState:
     
     CPU_FREQ_HISTORY_MAX = 1500   # 覆盖约 5 分钟（5 点/秒）
     GPU_FREQ_HISTORY_MAX = 1500   # 与 CPU 统一
+    IGPU_LOAD_HISTORY_MAX = 100   # 覆盖约 20 秒（0.2s/点），突变更灵敏
     
     def __init__(self):
         # CPU
@@ -106,10 +107,15 @@ class MagiState:
         self.current_gpu_power = 0.0
         self.gpu_temp = 0.0
         self.gpu_fan = "0"
+        # iGPU（7800X3D 核显，驱动副屏）
+        self.igpu_load = 0.0
+        self.igpu_load_history: list[float] = []
+        self.igpu_video_codec = 0.0
         self.gpu_mem_junc_temp: float = 0.0
         self.pcie_rx_mbs: float = 0.0
         self.pcie_tx_mbs: float = 0.0
         self.gpu_pstate: str = "P?"
+        self.gpu_ofa_util: float = 0.0
 
         # 其他
         self.used_p = 0.0
@@ -261,6 +267,17 @@ class MagiState:
             self.gpu_freq_history.append(val)
             if len(self.gpu_freq_history) > self.GPU_FREQ_HISTORY_MAX:
                 self.gpu_freq_history = self.gpu_freq_history[-self.GPU_FREQ_HISTORY_MAX:]
+
+    @property
+    def igpu_load_snapshot(self) -> list[float]:
+        with self._list_lock:
+            return list(self.igpu_load_history)
+
+    def add_igpu_load(self, val: float):
+        with self._list_lock:
+            self.igpu_load_history.append(val)
+            if len(self.igpu_load_history) > self.IGPU_LOAD_HISTORY_MAX:
+                self.igpu_load_history = self.igpu_load_history[-self.IGPU_LOAD_HISTORY_MAX:]
 
     def add_net_dn(self, kbps: float):
         """记录下载速度并更新全局最大值"""
@@ -599,23 +616,12 @@ def build_header() -> Panel:
 def build_melchior() -> Panel:
 
     cpu_snapshot = state.get_cpu_freq_snapshot(state.CPU_FREQ_HISTORY_MAX)
-
-    spark = generate_braille_trend(
-        cpu_snapshot, 
-        width=22, 
-        y_range=(CPU_FREQ_MIN, CPU_FREQ_MAX),
-        low_color="cyan", 
-        mid_color="yellow", 
-        high_color="red1"
-    )
-
-    history = cpu_snapshot   # 改用线程安全的快照
+    history = cpu_snapshot
     if history:
         f_min = min(history)
         f_max = max(history)
         f_now = history[-1]
         arrow = get_trend_arrow(history)
-        # 组装文本
         freq_str = (
             f"[dim]{f_min:.0f}[/] "
             f"[bold gold1]{f_now:.0f} MHz {arrow}[/] "
@@ -623,8 +629,19 @@ def build_melchior() -> Panel:
         )
     else:
         freq_str = "[dim]collecting...[/]"
-        
-    # ── FUSE 副标题：在渲染时刻直接用当前功耗+频率判定四级 ──
+
+    # iGPU D3D 3D + Copy 负载点阵
+    igpu_snapshot = state.igpu_load_snapshot
+    spark = generate_braille_trend(
+        igpu_snapshot,
+        width=22,
+        y_range=(0, 72),
+        low_color="cyan",
+        mid_color="yellow",
+        high_color="red1"
+    )
+
+    # ── 边框闪烁仍由 CPU 功耗/频率决定 ──
     _pwr = state.current_cpu_power
     _eff = state.cpu_freq_nom
     if _pwr >= 50 and _eff >= 4700:
@@ -649,7 +666,14 @@ def build_melchior() -> Panel:
     t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.3f} V[/]")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
-    t.add_row("TREND",  spark)
+    t.add_row("iGPU",  spark)
+    # ── VCODEC（D3D Video Codec 0 活动指示）──
+    if state.igpu_video_codec > 1:
+        on = (time.time() * 5) % 2 < 1
+        _vcodec_str = f"[bold red1]ACTIVE[/]" if on else "[dim]ACTIVE[/]"
+    else:
+        _vcodec_str = "[green]IDLE[/]"
+    t.add_row("CODEC", _vcodec_str)
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     _active_color = "cyan" if state.active_cores <= 1 else \
                     "green" if state.active_cores <= 4 else \
@@ -735,6 +759,7 @@ def build_balthasar() -> Panel:
     t.add_row("PING",   ping_str)
     t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
     t.add_row("TCP",    tcp_str) 
+    t.add_row("PCIe",   f"[#00BFFF]▼{state.pcie_rx_mbs:.0f} MB/s[/][dim] | [/][#FF4500]▲{state.pcie_tx_mbs:.0f} MB/s[/]")
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red1"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
@@ -789,7 +814,24 @@ def build_casper() -> Panel:
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
-    t.add_row("PCIe",   f"[#7CFC00]▼{state.pcie_rx_mbs:.1f}G[/][dim] | [/][#FFE4B5]▲{state.pcie_tx_mbs:.1f}G[/]")
+    # ── FG（D3D Optical Flow Accelerator，帧生成指示）──
+    _ofa = state.gpu_ofa_util
+    if _ofa > 0:
+        _on = (time.time() * 5) % 2 < 1
+        _fg_str = f"[bold {'green' if _on else 'dim'}]FG ON [dim]({_ofa:.0f}%)[/][/]"
+    else:
+        _fg_str = "[red]FG OFF[/]"
+    t.add_row("DLSS",     _fg_str)
+    # ── CODEC（dGPU 解码器/编码器活动指示，by pynvml）──
+    _parts = []
+    if state.gpu_decoder_util > 1:
+        on = (time.time() * 5) % 2 < 1
+        _parts.append("[red1]DECODING[/]" if on else "[dim]DECODING[/]")
+    if state.gpu_encoder_util > 1:
+        on = (time.time() * 5) % 2 < 1
+        _parts.append("[yellow]ENCODING[/]" if on else "[dim]ENCODING[/]")
+    _vcodec_str = " [dim]|[/] ".join(_parts) if _parts else "[green]IDLE[/]"
+    t.add_row("CODEC", _vcodec_str)
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
@@ -1066,6 +1108,26 @@ class MAGIApp(App):
 
         fan_gpu = scanner.get_val("GPU Fan", "RPM", hw_contains="nvidia")
         if fan_gpu: state.gpu_fan = fan_gpu
+
+        ofa_str = scanner.get_val("D3D Optical Flow Accelerator 0", "%", hw_contains="nvidia")
+        if ofa_str is not None:
+            state.gpu_ofa_util = parse_n(ofa_str)
+
+        # iGPU 数据采样（D3D 3D + Copy + Video Codec 合并点阵，hw_contains="radeon"）
+        igpu_d3d = scanner.get_val("D3D 3D", "%", hw_contains="radeon")
+        igpu_copy = scanner.get_val("D3D Copy", "%", hw_contains="radeon")
+        codec_str = scanner.get_val("D3D Video Codec 0", "%", hw_contains="radeon")
+        if codec_str is None:
+            codec_str = scanner.get_val("D3D Video Codec 1", "%", hw_contains="radeon")
+        codec_val = parse_n(codec_str) if codec_str else 0.0
+        if igpu_d3d is not None or igpu_copy is not None or codec_str is not None:
+            combined = (parse_n(igpu_d3d) if igpu_d3d else 0.0) \
+                     + (parse_n(igpu_copy) if igpu_copy else 0.0) \
+                     + codec_val
+            state.igpu_load = min(combined, 100.0)
+            state.add_igpu_load(state.igpu_load)
+        # VCODEC 行单独使用 Video Codec 值
+        state.igpu_video_codec = codec_val
 
         # 其他数据
         mem_p = scanner.get_val("Total Memory Memory", "%")

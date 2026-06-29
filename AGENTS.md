@@ -33,6 +33,17 @@ python magi_monitor_MIX.py
 | BALTHASAR (System) | `BALTHASAR \| {name} {cpu}%` | `BALTHASAR \| chrome 23%` | Top CPU-consuming process (`.exe` stripped, 10 char trunc) |
 | CASPER (GPU) | `CASPER \| {status}` | `CASPER \| STBY` | pynvml Clocks Event Reasons → IDLE/STBY/BOOST/PWR/HOT; P-state from NVML `Performance State` |
 
+## Panel Rows
+
+| Panel | Row | Data Source | Notes |
+|-------|-----|-------------|-------|
+| MELCHIOR | TREND | iGPU `D3D 3D + Copy + Video Codec` via OHM `hw_contains="radeon"` | Braille trend, y_range=(0,25), combined sum clamp 100 |
+| MELCHIOR | VCODEC | iGPU `D3D Video Codec 0` via OHM `hw_contains="radeon"` | >1% → `CODEC` cyan bold, else `IDLE` dim |
+| MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | Independent from subtitle; driven by CPU boost state |
+| BALTHASAR | PCIe | OHM `GPU PCIe Rx/Tx` via `hw_contains="nvidia"` | Moved from CASPER, MB/s |
+| CASPER | CODEC | pynvml `gpu_decoder_util` / `gpu_encoder_util` | >1% → DECODING/ENCODING blink 5Hz |
+| CASPER | FG | OHM `D3D Optical Flow Accelerator 0` via `hw_contains="nvidia"` | >0% → FG ON (xx%) blink 3Hz, else FG OFF dim |
+
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
 - **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
@@ -59,7 +70,8 @@ python magi_monitor_MIX.py
 ## Design Notes
 
 - **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from OHM `Load/CPU Core #i` (with SMT: max of thread 1+9, 2+10, ...) and `Core #i (Effective)` / `Core #i`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
-- **MELCHIOR subtitle shows power+freq tier**: `CRITICAL` (red flash 2.5Hz, triggers border flash), `WARN` (gold, 1Hz), `ATTN` (green, 0.5Hz), `STBL` (cyan, reverse, no blink). Derived from `current_cpu_power` (Package) and `cpu_freq_nom` (Cores Average). Replaced original C-State group indicator.
+- **MELCHIOR TREND row**: Replaced CPU frequency braille trend with iGPU `D3D 3D + Copy + Video Codec` combined load (%) braille trend. `y_range=(0,25)` for responsive display. History window = 100 points (~20s at 0.2s interval).
+- **MELCHIOR subtitle** uses `fuse_indicator` driven by CPU power + frequency, independent from iGPU state.
 - **MELCHIOR PKG-W shows C-State**: `52.3 W | C0` format, matching CASPER's `TGP | P0` format. Uses original `cpu_cstate_level` from effective/nominal freq ratio.
 - **CASPER TGP shows P-State**: `24.8 W | P0` format. P-State parsed from NVML `Performance State` field.
 - **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `endswith` for additional safety.
@@ -95,3 +107,9 @@ python magi_monitor_MIX.py
 - GPU polling 从 5s 改为 1s — 新增 `_collect_gpu` 定时器，与原 `_collect_slow_tasks` 拆离，避免 ping/TCP/进程枚举等被连带加速
 - **nvidia-smi 子进程 → pynvml 直调** — 移除两个 `subprocess.run(["nvidia-smi", ...])`，改用 pynvml 直接绑定 `nvml.dll`（无子进程，无 stdout 解析）；OHM(NVAPI) 的 GPU 传感器不动，保留崩溃时数据存活能力；`gpu_recovery_action` 替换为 `gpu_clk_reasons`（Clocks Event Reasons 原始 bitmask）
 - **iGPU 共存 OHM 传感器过滤** — CPU 启用集成显卡后，OHM 同时报告 iGPU + dGPU 同名传感器（GPU Core/MHz/°C 等），`get_val()` 新增 `hw_contains` 参数，所有 GPU 查询传入 `"nvidia"` 确保读取独显数据
+- **iGPU 监控（7800X3D 核显副屏）** — MELCHIOR 面板 TREND 行改用 iGPU `D3D 3D` 负载点阵（`hw_contains="radeon"`，y_range=0~70），subtitle 显示 `D3D Video Codec 0` 四档（40/25/10%）；border flash 保留 CPU 功耗/频率触发逻辑不变
+- **iGPU TREND 合并三引擎** — D3D 3D + Copy + Video Codec 三合一负载点阵，y_range 降至 (0,25) 提高敏感度
+- **MELCHIOR VCODEC 行** — 新增 D3D Video Codec 0 活动指示（>1% 亮 CODEC，否则 IDLE）
+- **CASPER VCODEC 行** — 新增 pynvml 解码器/编码器利用率活动指示（5Hz 闪烁）
+- **CASPER FG 行** — 新增 D3D Optical Flow Accelerator 0 帧生成活动指示（>0% 3Hz 闪烁带百分比）
+- **PCIe 行移至 BALTHASAR** — 原 CASPER PCIe 行移至 BALTHASAR DISK 行下方，修正单位从 G → MB/s
