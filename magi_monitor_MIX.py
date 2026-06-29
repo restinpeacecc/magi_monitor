@@ -981,6 +981,7 @@ class MAGIApp(App):
         self.push_screen(SplashScreen())
         # 初始化崩溃日志（裁剪到 30 分钟窗口）
         self._init_log()
+        self._last_scanner_update: float = 0.0
         # 缓存面板引用，避免 _refresh_all 中重复 query
         self._refresh_widgets = [
             self.query_one(MAGIHeader),
@@ -1016,7 +1017,10 @@ class MAGIApp(App):
         """在后台线程中执行阻塞 I/O 操作。
         exclusive=True 确保上次工作器未完成时跳过新调用。
         """
-        scanner.update()           # HTTP (OHM JSON API)
+        now = time.time()
+        if now - self._last_scanner_update >= 0.5:   # OHM 原生 500ms 刷新率
+            scanner.update()
+            self._last_scanner_update = now
 
         # CPU数据采样
         load_val = scanner.get_val("CPU Total", "%")
