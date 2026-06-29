@@ -86,6 +86,7 @@ class MagiState:
     CPU_FREQ_HISTORY_MAX = 1500   # 覆盖约 5 分钟（5 点/秒）
     GPU_FREQ_HISTORY_MAX = 1500   # 与 CPU 统一
     IGPU_LOAD_HISTORY_MAX = 100   # 覆盖约 20 秒（0.2s/点），突变更灵敏
+    GPU_MEM_HISTORY_MAX = 100     # 覆盖约 100 秒（1s/点）
     
     def __init__(self):
         # CPU
@@ -107,15 +108,16 @@ class MagiState:
         self.current_gpu_power = 0.0
         self.gpu_temp = 0.0
         self.gpu_fan = "0"
-        # iGPU（7800X3D 核显，驱动副屏）
-        self.igpu_load = 0.0
-        self.igpu_load_history: list[float] = []
-        self.igpu_video_codec = 0.0
         self.gpu_mem_junc_temp: float = 0.0
         self.pcie_rx_mbs: float = 0.0
         self.pcie_tx_mbs: float = 0.0
         self.gpu_pstate: str = "P?"
-        self.gpu_ofa_util: float = 0.0
+        self.gpu_mem_util_history: list[float] = []
+
+        # iGPU（7800X3D 核显，驱动副屏）
+        self.igpu_load = 0.0
+        self.igpu_load_history: list[float] = []
+        self.igpu_video_codec = 0.0
 
         # 其他
         self.used_p = 0.0
@@ -279,6 +281,17 @@ class MagiState:
             if len(self.igpu_load_history) > self.IGPU_LOAD_HISTORY_MAX:
                 self.igpu_load_history = self.igpu_load_history[-self.IGPU_LOAD_HISTORY_MAX:]
 
+    @property
+    def gpu_mem_util_snapshot(self) -> list[float]:
+        with self._list_lock:
+            return list(self.gpu_mem_util_history)
+
+    def add_gpu_mem_util(self, val: float):
+        with self._list_lock:
+            self.gpu_mem_util_history.append(val)
+            if len(self.gpu_mem_util_history) > self.GPU_MEM_HISTORY_MAX:
+                self.gpu_mem_util_history = self.gpu_mem_util_history[-self.GPU_MEM_HISTORY_MAX:]
+
     def add_net_dn(self, kbps: float):
         """记录下载速度并更新全局最大值"""
         if kbps > self.max_net_dn_kbps:
@@ -356,6 +369,7 @@ class MagiState:
             self.gpu_decoder_util = float(dec)
             self.gpu_encoder_util = float(enc)
             self.gpu_mem_util = float(mem_util)
+            self.add_gpu_mem_util(float(mem_util))
 
             self.gpu_clk_reasons = reasons
         except Exception:
@@ -580,6 +594,36 @@ def generate_braille_trend(values: list[float], width: int = 22,
         segments.append(f"[{color}]{chr(code)}[/]")
     return "".join(segments)
 
+def generate_sparkline(values: list[float], width: int = 22,
+                       y_range: tuple[float, float] | None = None,
+                       low_color: str = "cyan", mid_color: str = "yellow", high_color: str = "red1") -> str:
+    """Unicode 方块元素 sparkline，每格 8 级高度"""
+    SPARK = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    if len(values) < 2:
+        return "[dim]collecting...[/]"
+    if len(values) > width:
+        step = len(values) / width
+        data = [values[int(i * step)] for i in range(width)]
+    else:
+        data = values[-width:]
+    if y_range:
+        vmin, vmax = y_range
+    else:
+        vmin = vmax = data[0]
+        for v in data[1:]:
+            if v < vmin: vmin = v
+            elif v > vmax: vmax = v
+    if abs(vmax - vmin) < 1e-6:
+        vmin, vmax = vmax - 1, vmax + 1
+    segments = []
+    for v in data:
+        idx = int((v - vmin) / (vmax - vmin) * 8)
+        if idx == 8: idx = 7
+        ratio = (v - vmin) / (vmax - vmin)
+        color = high_color if ratio > 0.7 else (low_color if ratio < 0.3 else mid_color)
+        segments.append(f"[{color}]{SPARK[idx]}[/]")
+    return "".join(segments)
+
 def get_trend_arrow(values: list[float], threshold: float = 20) -> str:
     """根据最近25个点与前25个点的平均值比较，返回方向符号"""
     if len(values) < 25:
@@ -635,7 +679,7 @@ def build_melchior() -> Panel:
     spark = generate_braille_trend(
         igpu_snapshot,
         width=22,
-        y_range=(0, 72),
+        y_range=(0, 80),
         low_color="cyan",
         mid_color="yellow",
         high_color="red1"
@@ -814,14 +858,11 @@ def build_casper() -> Panel:
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
-    # ── FG（D3D Optical Flow Accelerator，帧生成指示）──
-    _ofa = state.gpu_ofa_util
-    if _ofa > 0:
-        _on = (time.time() * 5) % 2 < 1
-        _fg_str = f"[bold {'green' if _on else 'dim'}]FG ON [dim]({_ofa:.0f}%)[/][/]"
-    else:
-        _fg_str = "[red]FG OFF[/]"
-    t.add_row("DLSS",     _fg_str)
+    # ── MBUS（显存带宽利用率信号条 + 百分比，pynvml）──
+    _mu = state.gpu_mem_util
+    _mc = "cyan" if _mu < 15 else "green" if _mu < 30 else "yellow" if _mu < 45 else "red"
+    _bars = "".join("█" if _mu >= i * 25 else "░" for i in range(1, 5))
+    t.add_row("MBUS", f"[{_mc}]{_bars}[/] [bold {_mc}]{_mu:.0f}%[/]")
     # ── CODEC（dGPU 解码器/编码器活动指示，by pynvml）──
     _parts = []
     if state.gpu_decoder_util > 1:
@@ -1112,10 +1153,6 @@ class MAGIApp(App):
 
         fan_gpu = scanner.get_val("GPU Fan", "RPM", hw_contains="nvidia")
         if fan_gpu: state.gpu_fan = fan_gpu
-
-        ofa_str = scanner.get_val("D3D Optical Flow Accelerator 0", "%", hw_contains="nvidia")
-        if ofa_str is not None:
-            state.gpu_ofa_util = parse_n(ofa_str)
 
         # iGPU 数据采样（D3D 3D + Copy + Video Codec 合并点阵，hw_contains="radeon"）
         igpu_d3d = scanner.get_val("D3D 3D", "%", hw_contains="radeon")
