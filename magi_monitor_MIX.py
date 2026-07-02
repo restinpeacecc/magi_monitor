@@ -14,6 +14,14 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import win32evtlog
+    import win32evtlogutil
+    import winsound
+    HAS_WIN32EVT = True
+except ImportError:
+    HAS_WIN32EVT = False
+
 import psutil
 import requests
 from rich.align import Align
@@ -679,7 +687,7 @@ def build_melchior() -> Panel:
     spark = generate_braille_trend(
         igpu_snapshot,
         width=22,
-        y_range=(0, 80),
+        y_range=(0, 100),
         low_color="cyan",
         mid_color="yellow",
         high_color="red1"
@@ -803,7 +811,7 @@ def build_balthasar() -> Panel:
     t.add_row("PING",   ping_str)
     t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
     t.add_row("TCP",    tcp_str) 
-    t.add_row("PCIe",   f"[#00BFFF]▼{state.pcie_rx_mbs:.0f} MB/s[/][dim] | [/][#FF4500]▲{state.pcie_tx_mbs:.0f} MB/s[/]")
+    t.add_row("PCIe",   f"[#00BFFF]▼{state.pcie_rx_mbs:.0f} MB[/][dim] | [/][#FF4500]▲{state.pcie_tx_mbs:.0f} MB[/]")
     t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red1"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
@@ -867,10 +875,10 @@ def build_casper() -> Panel:
     _parts = []
     if state.gpu_decoder_util > 1:
         on = (time.time() * 5) % 2 < 1
-        _parts.append("[red1]DECODING[/]" if on else "[dim]DECODING[/]")
+        _parts.append("[bold red1]DECODING[/]" if on else "[dim]DECODING[/]")
     if state.gpu_encoder_util > 1:
         on = (time.time() * 5) % 2 < 1
-        _parts.append("[yellow]ENCODING[/]" if on else "[dim]ENCODING[/]")
+        _parts.append("[bold yellow]ENCODING[/]" if on else "[dim]ENCODING[/]")
     _vcodec_str = " [dim]|[/] ".join(_parts) if _parts else "[green]IDLE[/]"
     t.add_row("CODEC", _vcodec_str)
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
@@ -967,8 +975,87 @@ class SplashScreen(Screen):
             self.set_timer(1.5, self.dismiss_splash)
 
     def dismiss_splash(self) -> None:
-        self.app.pop_screen()
+        if self.app.screen is self:
+            self.app.pop_screen()
+        else:
+            self.set_timer(0.5, self.dismiss_splash)
         
+# ── Windows Event Log 全屏告警 ──────────────────────────────────────────────
+
+class EventLogAlertScreen(Screen):
+    """全屏阻塞式告警：事件日志匹配到指定 Event ID 时弹出，按键才消失。"""
+
+    CSS = """
+    EventLogAlertScreen {
+        align: center middle;
+        background: #1a0000;
+    }
+    #alert-box {
+        width: 62;
+        height: auto;
+        padding: 2 4;
+        border: heavy #ff4444;
+    }
+    .alert-line {
+        content-align: center middle;
+        width: 100%;
+    }
+    .alert-msg {
+        content-align: center middle;
+        width: 100%;
+        color: #cccccc;
+    }
+    .alert-dismiss {
+        content-align: center middle;
+        width: 100%;
+        color: #666666;
+        text-style: italic;
+    }
+    """
+
+    def __init__(self, event_id: int, source: str, message: str, time_str: str):
+        super().__init__()
+        self._event_id = event_id
+        self._source = source
+        self._message = message.strip()[:300]
+        self._time_str = time_str
+        self._blink = True
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="alert-box"):
+            yield Static("⚠  SYSTEM EVENT LOG ALERT  ⚠", classes="alert-line")
+            yield Static("", classes="alert-line")
+            yield Static(f"Event ID:  {self._event_id}", classes="alert-msg")
+            yield Static(f"Source:    {self._source}", classes="alert-msg")
+            yield Static(f"Time:      {self._time_str}", classes="alert-msg")
+            yield Static("", classes="alert-line")
+            yield Static(self._message, classes="alert-msg")
+            yield Static("", classes="alert-line")
+            yield Static("(Press any key to dismiss)", classes="alert-dismiss")
+
+    def on_mount(self) -> None:
+        self.set_interval(0.66, self._toggle_blink)
+
+    def _toggle_blink(self) -> None:
+        self._blink = not self._blink
+        box = self.query_one("#alert-box")
+        box.styles.border = ("heavy", "#ff4444" if self._blink else "#440000")
+
+    def on_key(self, event) -> None:
+        event.stop()
+        try:
+            self.app.pop_screen()
+        except Exception:
+            pass
+
+    def on_click(self, event) -> None:
+        event.stop()
+        try:
+            self.app.pop_screen()
+        except Exception:
+            pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  主应用
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1035,6 +1122,14 @@ class MAGIApp(App):
         self.set_interval(5.0, self._collect_slow_tasks) # 5s：Ping/TCP/进程
         self.set_interval(1.0, self._log_tick)    # 日志写入（1s）
 
+        # 启动 Windows 事件日志监控（后台线程轮询）
+        self._eventlog_shutdown = threading.Event()
+        self._eventlog_alerts: list[tuple] = []
+        self._eventlog_alert_lock = threading.Lock()
+        if HAS_WIN32EVT:
+            t = threading.Thread(target=self._eventlog_poller, daemon=True, name="evtlog")
+            t.start()
+
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
@@ -1043,6 +1138,7 @@ class MAGIApp(App):
 
         # 在主线程中处理 alert 和刷新（替代 worker 中的 call_from_thread）
         self._check_alert(state.cpu_temp, state.gpu_temp)
+        self._flush_eventlog_alerts()
         self._refresh_all()
 
         # 处理面板边框闪烁逻辑 (2.5 Hz)
@@ -1337,9 +1433,83 @@ class MAGIApp(App):
             else:
                 self.notify("[bold][#FFD700]⚠️  HIGH TEMPERATURE DETECTED", severity="warning", timeout=5)
 
+    # ── Windows 事件日志监控 ────────────────────────────────────────────
+
+    def _eventlog_poller(self) -> None:
+        """后台线程：每 2 秒轮询 System 日志，匹配 Event ID 129/136/153。"""
+        if not HAS_WIN32EVT:
+            return
+        try:
+            hand = win32evtlog.OpenEventLog(None, "System")
+            oldest = win32evtlog.GetOldestEventLogRecord(hand)
+            count = win32evtlog.GetNumberOfEventLogRecords(hand)
+            last_seen = oldest + count - 1
+        except Exception:
+            return
+
+        while not self._eventlog_shutdown.wait(5):
+            try:
+                oldest = win32evtlog.GetOldestEventLogRecord(hand)
+                count = win32evtlog.GetNumberOfEventLogRecords(hand)
+                current_last = oldest + count - 1
+                if current_last <= last_seen:
+                    continue
+
+                batch = win32evtlog.ReadEventLog(
+                    hand,
+                    win32evtlog.EVENTLOG_SEEK_READ | win32evtlog.EVENTLOG_FORWARDS_READ,
+                    last_seen + 1
+                )
+                while batch:
+                    for event in batch:
+                        eid = event.EventID & 0x0FFFFFFF
+                        if eid in {129, 136, 153, 1000}:
+                            try:
+                                msg = win32evtlogutil.SafeFormatMessage(event)
+                            except Exception:
+                                msg = "(no message)"
+                            source = event.SourceName
+                            ts = time.strftime("%H:%M:%S",
+                                               time.localtime(event.TimeGenerated.timestamp()))
+                            with self._eventlog_alert_lock:
+                                self._eventlog_alerts.append((eid, source, msg, ts))
+                    batch = win32evtlog.ReadEventLog(
+                        hand,
+                        win32evtlog.EVENTLOG_SEQUENTIAL_READ
+                        | win32evtlog.EVENTLOG_FORWARDS_READ,
+                        0
+                    )
+                last_seen = current_last
+            except BaseException:
+                continue
+
+    def _flush_eventlog_alerts(self) -> None:
+        if not HAS_WIN32EVT:
+            return
+        with self._eventlog_alert_lock:
+            if not self._eventlog_alerts:
+                return
+            alerts = self._eventlog_alerts[:]
+            self._eventlog_alerts.clear()
+        for eid, source, msg, ts in alerts:
+            try:
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+                self.push_screen(
+                    EventLogAlertScreen(eid, source, msg, ts),
+                    callback=lambda _: None
+                )
+            except Exception:
+                pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  入口点
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    MAGIApp().run()
+    import traceback as _tb
+    try:
+        MAGIApp().run()
+    except Exception:
+        (Path(__file__).parent / "crash.log").write_text(_tb.format_exc(), encoding="utf-8")
+        raise

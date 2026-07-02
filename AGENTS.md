@@ -2,17 +2,37 @@
 
 ## Run
 
+### Normal (non-elevated, no event log)
 ```
 python magi_monitor_MIX.py
 ```
+
+### Elevated (event log monitoring via WT profile)
+Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true`).
 
 ## Architecture
 
 - Single-file Textual TUI app (`magi_monitor_MIX.py`), entry point: `MAGIApp().run()`
 - Reads hardware sensors from **OpenHardwareMonitor / LibreHardwareMonitor** JSON API at `http://localhost:8085/data.json` via `MAGIScanner`
 - GPU status via **pynvml** (direct `nvml.dll` binding, no subprocess), polled every 1s
-- Requires `psutil`, `requests`, and `nvidia-ml-py` (no `pyproject.toml` / `requirements.txt` — install manually)
+- Windows Event Log monitoring via **pywin32** (`win32evtlog`), polled in a background thread every 5s
+- Requires `psutil`, `requests`, `nvidia-ml-py`, `pywin32` (no `pyproject.toml` / `requirements.txt` — install manually)
 - No test suite, no lint/typecheck config
+
+## Windows Event Log Monitoring
+
+- Monitors the **System** log for Event IDs `{129, 136, 153, 7040}` (NVMe disk errors + service start type changes)
+- Runs in a **background daemon thread** (`evtlog`), polling via `win32evtlog.ReadEventLog` every 5s
+- Uses a **thread-safe queue** (`list` + `Lock`) — the poller appends alerts, the main thread's `_tick` drains them via `_flush_eventlog_alerts()`
+- **Requires elevation** (admin) to open the System log with `OpenEventLog`
+- **Launch method**: Windows Terminal profile with `"elevate": true` (created at `%LOCALAPPDATA%\Packages\Microsoft.WindowsTerminal_*`)
+- On match: plays `winsound.MessageBeep(MB_ICONHAND)`, pushes a full-screen `EventLogAlertScreen` (dark red, red border, event details)
+- Dismiss: any key or click → `pop_screen()` returns to the main TUI
+- **Edge cases (fixed)**:
+  - `time.localtime(event.TimeGenerated)` fails because `pywintypes.datetime` is not int — use `.timestamp()`
+  - CSS color variables (`$error`, `$text`, `$surface`) cause native crash under elevated WT — use literal hex colors (`#ff4444`, `#cccccc`, `#666666`)
+  - SplashScreen's auto-dismiss `pop_screen()` pops the alert (top screen) instead of itself — check `app.screen is self` and retry 0.5s later
+  - `EventLogAlertScreen` with blink timer (`set_interval(0.66, ...)`) causes segfault-like crash (WT also dies) when CSS uses `$` color variables — root cause unknown but using hex colors + blink works fine
 
 ## Four-Tier Timer Model
 
