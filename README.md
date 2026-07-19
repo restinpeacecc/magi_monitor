@@ -142,7 +142,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 - PING: 网络延迟（颜色编码）
 - MEMTMP: 内存温度（颜色编码，与 CPU/GPU 温度行对齐）
 - TCP: EST/TW 连接数
-- DISK: 磁盘读写速度
+- DISK: 磁盘总吞吐 Unicode 方块 sparkline（0~200 MB/s，绿→黄→红）
 - PCIe: PCIe 接收/发送速率（MB/s）
 
 ### CASPER (GPU)

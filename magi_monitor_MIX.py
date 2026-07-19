@@ -95,6 +95,7 @@ class MagiState:
     GPU_FREQ_HISTORY_MAX = 1500   # 与 CPU 统一
     IGPU_LOAD_HISTORY_MAX = 100   # 覆盖约 20 秒（0.2s/点），突变更灵敏
     GPU_MEM_HISTORY_MAX = 100     # 覆盖约 100 秒（1s/点）
+    DISK_HISTORY_MAX = 300       # 覆盖约 60 秒（1s/点）
     
     def __init__(self):
         # CPU
@@ -107,6 +108,8 @@ class MagiState:
         self.cpu_vids: list[float] = [0.0] * 8
         self.cpu_eff_freq: float = 0.0
         self.cpu_freq_nom: float = 0.0
+        self.cpu_freq_session_min: float = float('inf')
+        self.cpu_freq_session_max: float = 0.0
 
         # GPU
         self.gpu_load = 0.0
@@ -120,6 +123,8 @@ class MagiState:
         self.pcie_rx_mbs: float = 0.0
         self.pcie_tx_mbs: float = 0.0
         self.gpu_pstate: str = "P?"
+        self.gpu_freq_session_min: float = float('inf')
+        self.gpu_freq_session_max: float = 0.0
         self.gpu_mem_util_history: list[float] = []
 
         # iGPU（7800X3D 核显，驱动副屏）
@@ -135,6 +140,7 @@ class MagiState:
         self.max_net_dn_kbps: float = 0.0
         self.boot_time: float      = psutil.boot_time()
         self.weather: str          = "LOADING..."
+        self.disk_history: list[float] = []
         self.last_weather_update: float = 0.0
 
         # Swap
@@ -271,12 +277,21 @@ class MagiState:
             self.cpu_freq_history.append(val)
             if len(self.cpu_freq_history) > self.CPU_FREQ_HISTORY_MAX:
                 self.cpu_freq_history = self.cpu_freq_history[-self.CPU_FREQ_HISTORY_MAX:]
+        # 会话级极值（无锁，仅标量写入）
+        if val < self.cpu_freq_session_min:
+            self.cpu_freq_session_min = val
+        if val > self.cpu_freq_session_max:
+            self.cpu_freq_session_max = val
 
     def add_gpu_freq(self, val: float):
         with self._list_lock:
             self.gpu_freq_history.append(val)
             if len(self.gpu_freq_history) > self.GPU_FREQ_HISTORY_MAX:
                 self.gpu_freq_history = self.gpu_freq_history[-self.GPU_FREQ_HISTORY_MAX:]
+        if val < self.gpu_freq_session_min:
+            self.gpu_freq_session_min = val
+        if val > self.gpu_freq_session_max:
+            self.gpu_freq_session_max = val
 
     @property
     def igpu_load_snapshot(self) -> list[float]:
@@ -299,6 +314,17 @@ class MagiState:
             self.gpu_mem_util_history.append(val)
             if len(self.gpu_mem_util_history) > self.GPU_MEM_HISTORY_MAX:
                 self.gpu_mem_util_history = self.gpu_mem_util_history[-self.GPU_MEM_HISTORY_MAX:]
+
+    @property
+    def disk_snapshot(self) -> list[float]:
+        with self._list_lock:
+            return list(self.disk_history)
+
+    def add_disk(self, val: float):
+        with self._list_lock:
+            self.disk_history.append(val)
+            if len(self.disk_history) > self.DISK_HISTORY_MAX:
+                self.disk_history = self.disk_history[-self.DISK_HISTORY_MAX:]
 
     def add_net_dn(self, kbps: float):
         """记录下载速度并更新全局最大值"""
@@ -670,8 +696,8 @@ def build_melchior() -> Panel:
     cpu_snapshot = state.get_cpu_freq_snapshot(state.CPU_FREQ_HISTORY_MAX)
     history = cpu_snapshot
     if history:
-        f_min = min(history)
-        f_max = max(history)
+        f_min = state.cpu_freq_session_min if state.cpu_freq_session_min != float('inf') else 0
+        f_max = state.cpu_freq_session_max
         f_now = history[-1]
         arrow = get_trend_arrow(history)
         freq_str = (
@@ -720,7 +746,7 @@ def build_melchior() -> Panel:
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("iGPU",  spark)
     # ── VCODEC（D3D Video Codec 0 活动指示）──
-    if state.igpu_video_codec > 1:
+    if state.igpu_video_codec > 0:
         on = (time.time() * 5) % 2 < 1
         _vcodec_str = f"[bold red1]ACTIVE[/]" if on else "[dim]ACTIVE[/]"
     else:
@@ -810,9 +836,10 @@ def build_balthasar() -> Panel:
     t.add_row("NET-DN", net_display) 
     t.add_row("PING",   ping_str)
     t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
+    _disk_spark = generate_sparkline(state.disk_snapshot, width=22, y_range=(0, 200), low_color="cyan", mid_color="yellow", high_color="red1")
+    t.add_row("DISK",   _disk_spark)
     t.add_row("TCP",    tcp_str) 
     t.add_row("PCIe",   f"[#00BFFF]▼{state.pcie_rx_mbs:.0f} MB[/][dim] | [/][#FF4500]▲{state.pcie_tx_mbs:.0f} MB[/]")
-    t.add_row("DISK",   f"[indian_red1]R:{state.disk_r:.1f} W:{state.disk_w:.1f} MB/s[/]")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red1"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
     bal_title = f"[bold orange3]BALTHASAR[/] | [bold {_top_color}]{_top_display}[/]"
@@ -850,8 +877,8 @@ def build_casper() -> Panel:
 
     history = gpu_snapshot   # 改用线程安全的快照
     if history and len(history) >= 2:
-        f_min = min(history)
-        f_max = max(history)
+        f_min = state.gpu_freq_session_min if state.gpu_freq_session_min != float('inf') else 0
+        f_max = state.gpu_freq_session_max
         f_now = history[-1]
         arrow = get_trend_arrow(history)
         freq_display = f"[dim]{f_min:.0f}[/] [bold gold1]{f_now:.0f} MHz {arrow}[/] [dim]{f_max:.0f}[/]"
@@ -873,10 +900,10 @@ def build_casper() -> Panel:
     t.add_row("MBUS", f"[{_mc}]{_bars}[/] [bold {_mc}]{_mu:.0f}%[/]")
     # ── CODEC（dGPU 解码器/编码器活动指示，by pynvml）──
     _parts = []
-    if state.gpu_decoder_util > 1:
+    if state.gpu_decoder_util > 0:
         on = (time.time() * 5) % 2 < 1
         _parts.append("[bold red1]DECODING[/]" if on else "[dim]DECODING[/]")
-    if state.gpu_encoder_util > 1:
+    if state.gpu_encoder_util > 0:
         on = (time.time() * 5) % 2 < 1
         _parts.append("[bold yellow]ENCODING[/]" if on else "[dim]ENCODING[/]")
     _vcodec_str = " [dim]|[/] ".join(_parts) if _parts else "[green]IDLE[/]"
@@ -1306,6 +1333,7 @@ class MAGIApp(App):
 
         # 磁盘速度放在传感器采样后，减小时间偏差
         state.refresh_disk_speed()
+        state.add_disk(state.disk_r + state.disk_w)
 
         # P-STAT (Balthasar) 的临界判断基于总功耗 (与 build_balthasar 中的逻辑一致)
         total_pwr = state.current_cpu_power + state.current_gpu_power + BASE_POWER_OFFSET
@@ -1462,7 +1490,7 @@ class MAGIApp(App):
                 )
                 while batch:
                     for event in batch:
-                        eid = event.EventID & 0x0FFFFFFF
+                        eid = event.EventID & 0xFFFF
                         if eid in {129, 136, 153, 1000}:
                             try:
                                 msg = win32evtlogutil.SafeFormatMessage(event)

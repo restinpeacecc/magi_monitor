@@ -61,6 +61,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 | MELCHIOR | VCODEC | iGPU `D3D Video Codec 0` via OHM `hw_contains="radeon"` | >1% → `CODEC` cyan bold, else `IDLE` dim |
 | MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | Independent from subtitle; driven by CPU boost state |
 | BALTHASAR | PCIe | OHM `GPU PCIe Rx/Tx` via `hw_contains="nvidia"` | Moved from CASPER, MB/s |
+| BALTHASAR | DISK | `psutil.disk_io_counters` R+W 总和 | 方块 sparkline, y_range=(0,200), 绿/黄/红三色 |
 | CASPER | CODEC | pynvml `gpu_decoder_util` / `gpu_encoder_util` | >1% → DECODING/ENCODING blink 5Hz |
 | CASPER | FG | OHM `D3D Optical Flow Accelerator 0` via `hw_contains="nvidia"` | >0% → FG ON (xx%) blink 3Hz, else FG OFF dim |
 
@@ -133,3 +134,4 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 - **CASPER VCODEC 行** — 新增 pynvml 解码器/编码器利用率活动指示（5Hz 闪烁）
 - **CASPER FG 行** — 新增 D3D Optical Flow Accelerator 0 帧生成活动指示（>0% 3Hz 闪烁带百分比）
 - **PCIe 行移至 BALTHASAR** — 原 CASPER PCIe 行移至 BALTHASAR DISK 行下方，修正单位从 G → MB/s
+- **DISK 行改为 sparkline** — 替换数字 `R:xx W:xx MB/s` 为 `generate_sparkline()` 方块 sparkline，`y_range=(0, 200)` 适配 NVMe + HDD 混合场景，新增 `disk_history` 100 点历史缓冲
