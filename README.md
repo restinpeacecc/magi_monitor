@@ -128,8 +128,8 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 - V-AVG: 平均 VID 电压
 - PKG-W: CPU 封装功耗 + C-State
 - TEMP: CPU 温度（颜色编码）
-- iGPU: D3D 3D + Copy + Video Codec 三合一 Braille 点阵趋势
-- VCODEC: iGPU 视频编解码活动指示（CODEC / IDLE）
+- iGPU: D3D 3D + D3D Copy 双引擎 Braille 点阵趋势
+- iCORE: iGPU GPU Core 利用率数值显示（>0% 三级着色，IDLE 绿色）
 - FAN: CPU 风扇转速
 
 ### BALTHASAR (SYSTEM)

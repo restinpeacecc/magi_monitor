@@ -57,8 +57,8 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 | Panel | Row | Data Source | Notes |
 |-------|-----|-------------|-------|
-| MELCHIOR | TREND | iGPU `D3D 3D + Copy + Video Codec` via OHM `hw_contains="radeon"` | Braille trend, y_range=(0,25), combined sum clamp 100 |
-| MELCHIOR | VCODEC | iGPU `D3D Video Codec 0` via OHM `hw_contains="radeon"` | >1% → `CODEC` cyan bold, else `IDLE` dim |
+| MELCHIOR | TREND | iGPU `D3D 3D + D3D Copy` via OHM `hw_contains="radeon"` | Braille trend, y_range=(0,25), combined sum clamp 100 |
+| MELCHIOR | iCORE | iGPU `GPU Core` via OHM `hw_contains="radeon"` | >0% → green/yellow/red 三级着色, else `IDLE` |
 | MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | Independent from subtitle; driven by CPU boost state |
 | BALTHASAR | PCIe | OHM `GPU PCIe Rx/Tx` via `hw_contains="nvidia"` | Moved from CASPER, MB/s |
 | BALTHASAR | DISK | `psutil.disk_io_counters` R+W 总和 | 方块 sparkline, y_range=(0,200), 绿/黄/红三色 |
@@ -91,7 +91,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 ## Design Notes
 
 - **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from OHM `Load/CPU Core #i` (with SMT: max of thread 1+9, 2+10, ...) and `Core #i (Effective)` / `Core #i`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
-- **MELCHIOR TREND row**: Replaced CPU frequency braille trend with iGPU `D3D 3D + Copy + Video Codec` combined load (%) braille trend. `y_range=(0,25)` for responsive display. History window = 100 points (~20s at 0.2s interval).
+- **MELCHIOR TREND row**: Replaced CPU frequency braille trend with iGPU `D3D 3D + D3D Copy` combined load (%) braille trend. `y_range=(0,25)` for responsive display. History window = 100 points (~20s at 0.2s interval).
 - **MELCHIOR subtitle** uses `fuse_indicator` driven by CPU power + frequency, independent from iGPU state.
 - **MELCHIOR PKG-W shows C-State**: `52.3 W | C0` format, matching CASPER's `TGP | P0` format. Uses original `cpu_cstate_level` from effective/nominal freq ratio.
 - **CASPER TGP shows P-State**: `24.8 W | P0` format. P-State parsed from NVML `Performance State` field.
@@ -129,8 +129,8 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 - **nvidia-smi 子进程 → pynvml 直调** — 移除两个 `subprocess.run(["nvidia-smi", ...])`，改用 pynvml 直接绑定 `nvml.dll`（无子进程，无 stdout 解析）；OHM(NVAPI) 的 GPU 传感器不动，保留崩溃时数据存活能力；`gpu_recovery_action` 替换为 `gpu_clk_reasons`（Clocks Event Reasons 原始 bitmask）
 - **iGPU 共存 OHM 传感器过滤** — CPU 启用集成显卡后，OHM 同时报告 iGPU + dGPU 同名传感器（GPU Core/MHz/°C 等），`get_val()` 新增 `hw_contains` 参数，所有 GPU 查询传入 `"nvidia"` 确保读取独显数据
 - **iGPU 监控（7800X3D 核显副屏）** — MELCHIOR 面板 TREND 行改用 iGPU `D3D 3D` 负载点阵（`hw_contains="radeon"`，y_range=0~70），subtitle 显示 `D3D Video Codec 0` 四档（40/25/10%）；border flash 保留 CPU 功耗/频率触发逻辑不变
-- **iGPU TREND 合并三引擎** — D3D 3D + Copy + Video Codec 三合一负载点阵，y_range 降至 (0,25) 提高敏感度
-- **MELCHIOR VCODEC 行** — 新增 D3D Video Codec 0 活动指示（>1% 亮 CODEC，否则 IDLE）
+- **iGPU TREND 双引擎** — D3D 3D + D3D Copy 双引擎负载点阵，移除因 bug 不可用的 Video Codec；GPU Core % 独立显示于 iCORE 行
+- **MELCHIOR iCORE 行** — 原 VCODEC 行替换为 GPU Core 利用率数值显示（>0% 三级着色，=0% 绿色 IDLE）
 - **CASPER VCODEC 行** — 新增 pynvml 解码器/编码器利用率活动指示（5Hz 闪烁）
 - **CASPER FG 行** — 新增 D3D Optical Flow Accelerator 0 帧生成活动指示（>0% 3Hz 闪烁带百分比）
 - **PCIe 行移至 BALTHASAR** — 原 CASPER PCIe 行移至 BALTHASAR DISK 行下方，修正单位从 G → MB/s

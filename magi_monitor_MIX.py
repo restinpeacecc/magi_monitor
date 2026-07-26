@@ -95,7 +95,7 @@ class MagiState:
     GPU_FREQ_HISTORY_MAX = 1500   # 与 CPU 统一
     IGPU_LOAD_HISTORY_MAX = 100   # 覆盖约 20 秒（0.2s/点），突变更灵敏
     GPU_MEM_HISTORY_MAX = 100     # 覆盖约 100 秒（1s/点）
-    DISK_HISTORY_MAX = 300       # 覆盖约 60 秒（1s/点）
+    DISK_HISTORY_MAX = 300        # 覆盖约 1 分钟（0.2s/点）
     
     def __init__(self):
         # CPU
@@ -130,7 +130,7 @@ class MagiState:
         # iGPU（7800X3D 核显，驱动副屏）
         self.igpu_load = 0.0
         self.igpu_load_history: list[float] = []
-        self.igpu_video_codec = 0.0
+        self.igpu_core_pct = 0.0
 
         # 其他
         self.used_p = 0.0
@@ -652,9 +652,10 @@ def generate_sparkline(values: list[float], width: int = 22,
     segments = []
     for v in data:
         idx = int((v - vmin) / (vmax - vmin) * 8)
-        if idx == 8: idx = 7
+        if idx > 7: idx = 7
+        elif idx < 0: idx = 0
         ratio = (v - vmin) / (vmax - vmin)
-        color = high_color if ratio > 0.7 else (low_color if ratio < 0.3 else mid_color)
+        color = high_color if ratio > 0.9 else (low_color if ratio < 0.3 else mid_color)
         segments.append(f"[{color}]{SPARK[idx]}[/]")
     return "".join(segments)
 
@@ -716,7 +717,7 @@ def build_melchior() -> Panel:
         y_range=(0, 100),
         low_color="cyan",
         mid_color="yellow",
-        high_color="red1"
+        high_color="red"
     )
 
     # ── 边框闪烁仍由 CPU 功耗/频率决定 ──
@@ -745,13 +746,14 @@ def build_melchior() -> Panel:
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
     t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
     t.add_row("iGPU",  spark)
-    # ── VCODEC（D3D Video Codec 0 活动指示）──
-    if state.igpu_video_codec > 0:
-        on = (time.time() * 5) % 2 < 1
-        _vcodec_str = f"[bold red1]ACTIVE[/]" if on else "[dim]ACTIVE[/]"
+    # ── iCORE（iGPU GPU Core 利用率，三档着色）──
+    _core = state.igpu_core_pct
+    if _core > 0:
+        _cc = "green" if _core < 30 else "yellow" if _core < 70 else "red"
+        _core_str = f"[bold {_cc}]{_core:.0f}%[/]"
     else:
-        _vcodec_str = "[green]IDLE[/]"
-    t.add_row("CODEC", _vcodec_str)
+        _core_str = "[green]IDLE[/]"
+    t.add_row("iCORE", _core_str)
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     _active_color = "cyan" if state.active_cores <= 1 else \
                     "green" if state.active_cores <= 4 else \
@@ -836,11 +838,11 @@ def build_balthasar() -> Panel:
     t.add_row("NET-DN", net_display) 
     t.add_row("PING",   ping_str)
     t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
-    _disk_spark = generate_sparkline(state.disk_snapshot, width=22, y_range=(0, 200), low_color="cyan", mid_color="yellow", high_color="red1")
+    _disk_spark = generate_sparkline(state.disk_snapshot, width=22, y_range=(0, 50), low_color="cyan", mid_color="yellow", high_color="red")
     t.add_row("DISK",   _disk_spark)
     t.add_row("TCP",    tcp_str) 
     t.add_row("PCIe",   f"[#00BFFF]▼{state.pcie_rx_mbs:.0f} MB[/][dim] | [/][#FF4500]▲{state.pcie_tx_mbs:.0f} MB[/]")
-    _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red1"
+    _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
     bal_title = f"[bold orange3]BALTHASAR[/] | [bold {_top_color}]{_top_display}[/]"
     
@@ -1277,21 +1279,17 @@ class MAGIApp(App):
         fan_gpu = scanner.get_val("GPU Fan", "RPM", hw_contains="nvidia")
         if fan_gpu: state.gpu_fan = fan_gpu
 
-        # iGPU 数据采样（D3D 3D + Copy + Video Codec 合并点阵，hw_contains="radeon"）
+        # iGPU 数据采样（D3D 3D + D3D Copy 合并点阵 + GPU Core % 单独显示，hw_contains="radeon"）
         igpu_d3d = scanner.get_val("D3D 3D", "%", hw_contains="radeon")
         igpu_copy = scanner.get_val("D3D Copy", "%", hw_contains="radeon")
-        codec_str = scanner.get_val("D3D Video Codec 0", "%", hw_contains="radeon")
-        if codec_str is None:
-            codec_str = scanner.get_val("D3D Video Codec 1", "%", hw_contains="radeon")
-        codec_val = parse_n(codec_str) if codec_str else 0.0
-        if igpu_d3d is not None or igpu_copy is not None or codec_str is not None:
+        if igpu_d3d is not None or igpu_copy is not None:
             combined = (parse_n(igpu_d3d) if igpu_d3d else 0.0) \
-                     + (parse_n(igpu_copy) if igpu_copy else 0.0) \
-                     + codec_val
+                     + (parse_n(igpu_copy) if igpu_copy else 0.0)
             state.igpu_load = min(combined, 100.0)
             state.add_igpu_load(state.igpu_load)
-        # VCODEC 行单独使用 Video Codec 值
-        state.igpu_video_codec = codec_val
+        # iCORE 行单独使用 GPU Core 利用率
+        igpu_core_str = scanner.get_val("GPU Core", "%", hw_contains="radeon")
+        state.igpu_core_pct = parse_n(igpu_core_str) if igpu_core_str else 0.0
 
         # 其他数据
         mem_p = scanner.get_val("Total Memory Memory", "%")
@@ -1491,7 +1489,7 @@ class MAGIApp(App):
                 while batch:
                     for event in batch:
                         eid = event.EventID & 0xFFFF
-                        if eid in {129, 136, 153, 1000}:
+                        if eid in {129, 136, 153, 1000, 50, 140}:
                             try:
                                 msg = win32evtlogutil.SafeFormatMessage(event)
                             except Exception:
