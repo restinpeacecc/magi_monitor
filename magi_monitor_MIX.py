@@ -77,6 +77,7 @@ LOG_COLUMNS = [
     "time","cpu_load","cpu_temp","cpu_pkg_w","cpu_eff_freq","cstate","cpu_fan",
     "cpu_vid1","cpu_vid2","cpu_vid3","cpu_vid4","cpu_vid5","cpu_vid6","cpu_vid7","cpu_vid8",
     "mem_pct","mem_temp",
+    "nvme1_temp","nvme2_temp","sata_temp",
     "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status","gpu_pstate",
     "pcie_rx","pcie_tx",
     "v3v3","vcore_v",
@@ -162,6 +163,9 @@ class MagiState:
         self.disk_w: float = 0.0
         self.ping_ms: float = 0.0
         self.mem_temp: float = 0.0
+        self.nvme1_temp: float = 0.0   # WD_BLACK SN850X
+        self.nvme2_temp: float = 0.0   # SPCC M.2 PCIe SSD
+        self.sata_temp: float = 0.0    # WD Blue SA510
         self.v3v3: float = 0.0
         self.vcore_v: float = 0.0
 
@@ -837,7 +841,11 @@ def build_balthasar() -> Panel:
     t.add_row("SWAP",   generate_bar(state.swap_pct, color="magenta"))
     t.add_row("NET-DN", net_display) 
     t.add_row("PING",   ping_str)
-    t.add_row("MEMTMP",  f"[bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f} °C[/]")
+    _mt = f"[dim]RM[/][bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f}[/]"
+    _wd = f"[dim]WD[/][bold {get_temp_color(state.nvme1_temp)}]{state.nvme1_temp:.0f}[/]"
+    _sp = f"[dim]SP[/][bold {get_temp_color(state.nvme2_temp)}]{state.nvme2_temp:.0f}[/]"
+    _st = f"[dim]ST[/][bold {get_temp_color(state.sata_temp)}]{state.sata_temp:.0f}[/]"
+    t.add_row("MEMTMP",  f"{_mt} {_wd} {_sp} {_st} °C")
     _disk_spark = generate_sparkline(state.disk_snapshot, width=22, y_range=(0, 50), low_color="cyan", mid_color="yellow", high_color="red")
     t.add_row("DISK",   _disk_spark)
     t.add_row("TCP",    tcp_str) 
@@ -1308,6 +1316,15 @@ class MAGIApp(App):
         dimm_t = scanner.get_val("DIMM #1", "°C")
         if dimm_t is not None:
             state.mem_temp = parse_n(dimm_t)
+        nv1_t = scanner.get_val("Temperature", "°C", hw_contains="sn850x")
+        if nv1_t is not None:
+            state.nvme1_temp = parse_n(nv1_t)
+        nv2_t = scanner.get_val("Temperature", "°C", hw_contains="spcc")
+        if nv2_t is not None:
+            state.nvme2_temp = parse_n(nv2_t)
+        sata_t = scanner.get_val("Temperature", "°C", hw_contains="sa510")
+        if sata_t is not None:
+            state.sata_temp = parse_n(sata_t)
         v3 = scanner.get_val("+3.3V", "V")
         if v3 is not None:
             state.v3v3 = parse_n(v3)
@@ -1400,6 +1417,7 @@ class MAGIApp(App):
                 f"{s.cpu_eff_freq:.0f},{s.cpu_cstate_level},{s.cpu_fan},"
                 f"{','.join(f'{v:.3f}' for v in s.cpu_vids)},"
                 f"{s.used_p:.1f},{s.mem_temp:.1f},"
+                f"{s.nvme1_temp:.1f},{s.nvme2_temp:.1f},{s.sata_temp:.1f},"
                 f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
                 f"{s.current_gpu_power:.1f},{s.gpu_freq_history[-1] if s.gpu_freq_history else 0:.0f},"
                 f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},{s.gpu_pstate},"

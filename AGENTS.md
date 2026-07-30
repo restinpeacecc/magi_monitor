@@ -60,6 +60,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 | MELCHIOR | TREND | iGPU `D3D 3D + D3D Copy` via OHM `hw_contains="radeon"` | Braille trend, y_range=(0,25), combined sum clamp 100 |
 | MELCHIOR | iCORE | iGPU `GPU Core` via OHM `hw_contains="radeon"` | >0% → green/yellow/red 三级着色, else `IDLE` |
 | MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | Independent from subtitle; driven by CPU boost state |
+| BALTHASAR | MEMTMP | OHM `DIMM #1, Temperature` via `hw_contains="sn850x"/"spcc"/"sa510"` | `RM{val} WD{val} SP{val} ST{val} °C`, 白标签+色数值 |
 | BALTHASAR | PCIe | OHM `GPU PCIe Rx/Tx` via `hw_contains="nvidia"` | Moved from CASPER, MB/s |
 | BALTHASAR | DISK | `psutil.disk_io_counters` R+W 总和 | 方块 sparkline, y_range=(0,200), 绿/黄/红三色 |
 | CASPER | CODEC | pynvml `gpu_decoder_util` / `gpu_encoder_util` | >1% → DECODING/ENCODING blink 5Hz |
@@ -68,7 +69,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
 - **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
-- **Columns** (36 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vid1~8,mem_pct,mem_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,pcie_rx,pcie_tx,v3v3,vcore_v,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
+- **Columns** (39 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vid1~8,mem_pct,mem_temp,nvme1_temp,nvme2_temp,sata_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,pcie_rx,pcie_tx,v3v3,vcore_v,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
 - **Writing**: `_log_tick()` every 1s, simple `open+append` on main thread
 - **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)
 - **Size cap**: `LOG_MAX_BYTES = 512KB` → auto trims to half when exceeded
@@ -135,3 +136,4 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 - **CASPER FG 行** — 新增 D3D Optical Flow Accelerator 0 帧生成活动指示（>0% 3Hz 闪烁带百分比）
 - **PCIe 行移至 BALTHASAR** — 原 CASPER PCIe 行移至 BALTHASAR DISK 行下方，修正单位从 G → MB/s
 - **DISK 行改为 sparkline** — 替换数字 `R:xx W:xx MB/s` 为 `generate_sparkline()` 方块 sparkline，`y_range=(0, 200)` 适配 NVMe + HDD 混合场景，新增 `disk_history` 100 点历史缓冲
+- **Drive Temperature Monitoring** — MEMTMP 行新增 WD_BLACK SN850X(NVMe) + SPCC M.2(NVMe) + WD Blue SA510(SATA) 温度监控，`RM{val} WD{val} SP{val} ST{val} °C` 紧凑格式白标签+色数值，三字段写入 crash_log.csv

@@ -140,7 +140,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 - SWAP: 交换分区使用率
 - NET-DN: 当前下载速度 @ 历史最大
 - PING: 网络延迟（颜色编码）
-- MEMTMP: 内存温度（颜色编码，与 CPU/GPU 温度行对齐）
+- MEMTMP: 内存 + 硬盘温度，`RM{val} WD{val} SP{val} ST{val} °C` 格式（标签白字、数字着色，RM=内存, WD=SN850X, SP=SPCC, ST=SA510）
 - TCP: EST/TW 连接数
 - DISK: 磁盘总吞吐 Unicode 方块 sparkline（0~200 MB/s，绿→黄→红）
 - PCIe: PCIe 接收/发送速率（MB/s）
@@ -168,7 +168,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 
 ## 📝 崩溃恢复日志
 
-- **文件**: `logs/crash_log.csv`（36 列）
+- **文件**: `logs/crash_log.csv`（39 列）
 - **周期**: 每秒追加
 - **窗口**: 启动时裁剪到最近 30 分钟
 - **封顶**: 512KB，超出时保留前半行数
