@@ -134,6 +134,7 @@ class MagiState:
         self.igpu_core_pct = 0.0
 
         # 其他
+        self.mb_temp = 0.0
         self.used_p = 0.0
         self.used_gb = "0 GB"
         self.avail_gb = "0 GB"
@@ -748,7 +749,7 @@ def build_melchior() -> Panel:
     t.add_row("CORES",  build_core_heatmap(state.core_loads))
     t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.3f} V[/]")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
-    t.add_row("TEMP",   f"[bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f} °C[/]")
+    t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f}[/] [dim]MB[/][bold {get_temp_color(state.mb_temp)}]{state.mb_temp:.0f}[/] °C")
     t.add_row("iGPU",  spark)
     # ── iCORE（iGPU GPU Core 利用率，三档着色）──
     _core = state.igpu_core_pct
@@ -902,7 +903,7 @@ def build_casper() -> Panel:
     t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="#4a00f7"))
     t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
-    t.add_row("TEMP",   f"[bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f} °C[/]")
+    t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f}[/] [dim]MJ[/][bold {get_temp_color(state.gpu_mem_junc_temp)}]{state.gpu_mem_junc_temp:.0f}[/] °C")
     # ── MBUS（显存带宽利用率信号条 + 百分比，pynvml）──
     _mu = state.gpu_mem_util
     _mc = "cyan" if _mu < 15 else "green" if _mu < 30 else "yellow" if _mu < 45 else "red"
@@ -1300,6 +1301,10 @@ class MAGIApp(App):
         state.igpu_core_pct = parse_n(igpu_core_str) if igpu_core_str else 0.0
 
         # 其他数据
+        mb_temp = scanner.get_val("Temperature #1", "°C", hw_contains="Nuvoton")
+        if mb_temp is not None:
+            state.mb_temp = parse_n(mb_temp)
+
         mem_p = scanner.get_val("Total Memory Memory", "%")
         if mem_p is not None: state.used_p = parse_n(mem_p)
         
