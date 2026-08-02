@@ -62,10 +62,6 @@ from pynvml import (
 
 BASE_POWER_OFFSET = 45.0            # 主板/风扇/SSD 等基础功耗 (W)
 
-CPU_TEMP_CAUTION    = 50           # °C
-CPU_TEMP_WARNING    = 60
-CPU_TEMP_CRITICAL   = 70           # °C（fuse_crit 边框闪烁触发点）
-
 POWER_SAFE  = 100                  # W
 POWER_WARN  = 180
 POWER_CRIT  = 300
@@ -76,6 +72,13 @@ VRAM_USED_HIGH  = 50               # %
 CPU_FREQ_MIN = 3000.0              # MHz（Braille 曲线 Y 轴下限）
 CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 
+# HWiNFO64 周期性重启（规避 12 小时共享内存停更问题）
+HWiNFO_RESTART_INTERVAL = 11 * 3600 + 40 * 60   # 42000s = 11h40m
+HWiNFO_KILL_WAIT_SEC    = 5                     # 强杀后等待秒数再启动
+HWiNFO_LAUNCH_WAIT_SEC  = 3                     # 启动后验证进程存在的等待秒数
+HWiNFO_EXE_PATH         = r"C:\Program Files\HWiNFO64\HWiNFO64.EXE"
+HWiNFO_PROC_NAME        = "HWiNFO64.exe"
+
 LOG_DIR = "logs"
 LOG_FILE = "logs/crash_log.csv"
 LOG_MAX_BYTES = 512 * 1024         # 512 KB
@@ -85,8 +88,7 @@ LOG_COLUMNS = [
     "mem_pct","mem1_temp","mem2_temp",
     "nvme1_temp","nvme2_temp","sata_temp",
     "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status","gpu_pstate",
-    "pcie_link_gts",
-    "psu_v","v3vc",
+        "psu_v","v3vc",
     "top_proc","top_cpu",
     "gpu_decoder_util","gpu_encoder_util","gpu_mem_util","gpu_clk_reasons"
 ]
@@ -113,6 +115,9 @@ class MagiState:
         # PROCHOT 降频信号（HWiNFO thermal throttling，0=正常 1=触发）
         self.prochot_cpu: bool = False   # CPU 内部 DTS 过热（TjMax 89°C 触及）
         self.prochot_ext: bool = False   # 外部拉低（主板 VRM/外围过热）
+        # CPU TDC/EDC 电流限制占用率（HWiNFO 百分比）
+        self.cpu_tdc_pct: float = 0.0
+        self.cpu_edc_pct: float = 0.0
         self.current_cpu_power = 0.0
         self.cpu_temp = 0.0
         self.cpu_fan = "0"
@@ -130,9 +135,8 @@ class MagiState:
         self.gpu_temp = 0.0
         self.gpu_fan = "0"
         self.gpu_mem_junc_temp: float = 0.0
-        self.pcie_link_gts: float = 0.0   # HWiNFO: PCIe Link Speed (GT/s)
-        self.pcie_rx_bps: float = 0.0   # pynvml: PCIe RX 吞吐 (bytes/s)
-        self.pcie_tx_bps: float = 0.0   # pynvml: PCIe TX 吞吐 (bytes/s)
+        self.pcie_rx_bps: float = 0.0   # pynvml: PCIe RX 吞吐 (KB/s, NVML 原生单位)
+        self.pcie_tx_bps: float = 0.0   # pynvml: PCIe TX 吞吐 (KB/s, NVML 原生单位)
         self.gpu_pstate: str = "P?"
         self.gpu_freq_session_min: float = float('inf')
         self.gpu_freq_session_max: float = 0.0
@@ -239,12 +243,12 @@ class MagiState:
 
     # ── 警报 ────────────────────────────────────────────────────────────────
 
-    def update_alert(self, cpu_temp: float, gpu_temp: float):
-        """根据温度确定警报等级，返回 (原等级, 新等级)"""
+    def update_alert(self):
+        """根据 PROCHOT 过热降频信号确定警报等级，返回 (原等级, 新等级)"""
         old_level = self.alert_level
-        if cpu_temp >= 80 and gpu_temp >= 80:     # 自定义危险阈值（2级警报）
+        if self.prochot_cpu and self.prochot_ext:     # CPU 内核 + 主板 VRM 同时过热降频（2级警报）
             new_level = 2
-        elif cpu_temp >= 75 and gpu_temp >= 75:   # 1级警报
+        elif self.prochot_cpu or self.prochot_ext:    # 任一过热降频触发（1级警报）
             new_level = 1
         else:
             new_level = 0
@@ -751,6 +755,10 @@ def get_temp_color(temp_val) -> str:
         return "yellow"
     return "red1"
 
+def get_lim_color(val: float) -> str:
+    """TDC/EDC 限制占用率变色（与 iGPU 使用率一致：<30 绿 / <70 黄 / ≥70 红）"""
+    return "green" if val < 30 else "yellow" if val < 70 else "red"
+
 def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     val = float(value_str)
     # 返回格式: (颜色, 闪烁频率, 显示文本)
@@ -926,19 +934,9 @@ def build_melchior() -> Panel:
     t.add_row("V-DDC",  f"[dim]VDD[/][cadet_blue]{state.cpu_vddcr_v:.3f}[/] [dim]SOC[/][cadet_blue]{state.cpu_vdsoc_v:.3f}[/] V")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
     t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f}[/] [dim]#1[/][bold {get_temp_color(state.mem1_temp)}]{state.mem1_temp:.0f}[/] [dim]#3[/][bold {get_temp_color(state.mem2_temp)}]{state.mem2_temp:.0f}[/] °C")
-    # ── THRM：PROCHOT 降频状态（CPU 内核过热 / 主板 VRM 过热）──
-    _pc, _pe = state.prochot_cpu, state.prochot_ext
-    if _pc and _pe:
-        on = (time.time() * 5) % 2 < 1
-        thr_str = "[bold red1]CRITICAL OVERHEAT[/]" if on else "[dim]CRITICAL OVERHEAT[/]"
-    elif _pc:
-        on = (time.time() * 5) % 2 < 1
-        thr_str = "[bold red1]CPU THROTTLE[/]" if on else "[dim]CPU THROTTLE[/]"
-    elif _pe:
-        on = (time.time() * 5) % 2 < 1
-        thr_str = "[bold gold1]VRM THROTTLE[/]" if on else "[dim]VRM THROTTLE[/]"
-    else:
-        thr_str = "[cyan]NOMINAL[/]"
+    # ── LIMIT：CPU TDC/EDC 电流限制占用率（变色逻辑参考 iGPU 使用率）──
+    _tdc_s = f"[bold {get_lim_color(state.cpu_tdc_pct)}]{state.cpu_tdc_pct:.0f}%[/]" if state.cpu_tdc_pct else "[dim]--[/]"
+    _edc_s = f"[bold {get_lim_color(state.cpu_edc_pct)}]{state.cpu_edc_pct:.0f}%[/]" if state.cpu_edc_pct else "[dim]--[/]"
     t.add_row("iACTV",  spark)
     # ── iACTV（iGPU GPU Core 利用率，三档着色）──
     _core = state.igpu_core_pct
@@ -948,7 +946,7 @@ def build_melchior() -> Panel:
     else:
         _core_str = "[green]IDLE[/]"
     t.add_row("iGPU", _core_str + f"[dim] | [/][red]{state.igpu_mem:.0f} MB[/]")
-    t.add_row("THRM",  thr_str)
+    t.add_row("LIMIT",  f"[dim]TDC[/]{_tdc_s} [dim]EDC[/]{_edc_s}")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     _active_color = "cyan" if state.active_cores <= 1 else \
                     "green" if state.active_cores <= 4 else \
@@ -1111,27 +1109,25 @@ def build_casper() -> Panel:
         _parts.append("[bold yellow]ENCODING[/]" if on else "[dim]ENCODING[/]")
     _vcodec_str = " [dim]|[/] ".join(_parts) if _parts else "[green]IDLE[/]"
     t.add_row("CODEC", _vcodec_str)
-    _pcie_gts = state.pcie_link_gts
-    _pcie_color = "green" if _pcie_gts >= 16.0 else "yellow" if _pcie_gts >= 8.0 else "cyan"
     _pcie_throughput = ""
-    for _arrow, _bps in (("▼", state.pcie_rx_bps), ("▲", state.pcie_tx_bps)):
-        _v = _bps / 1000.0
-        if _v >= 1024 * 1024:
-            _s = f"{_v / 1024 / 1024:.1f}G"
-        elif _v >= 1024:
-            _s = f"{_v / 1024:.1f}M"
+    for _arrow, _kbps in (("▼", state.pcie_rx_bps), ("▲", state.pcie_tx_bps)):
+        # NVML 返回值为 KB/s 原生单位，不再除以 1000
+        if _kbps >= 1024 * 1024:
+            _s = f"{_kbps / 1024 / 1024:.1f}G"
+        elif _kbps >= 1024:
+            _s = f"{_kbps / 1024:.1f}M"
         else:
-            _s = f"{_v:.0f}K"
-        if _bps >= 1024 * 1024 * 1024:
+            _s = f"{_kbps:.0f}K"
+        if _kbps >= 1024 * 1024:
             _c = "red"
-        elif _bps >= 100 * 1024 * 1024:
+        elif _kbps >= 100 * 1024:
             _c = "yellow"
-        elif _bps >= 1 * 1024 * 1024:
+        elif _kbps >= 1024:
             _c = "green"
         else:
             _c = "dim"
         _pcie_throughput += f" [{_c}]{_arrow}{_s}[/]"
-    t.add_row("PCIe",   f"[bold {_pcie_color}]{_pcie_gts:.1f} GT/s[/]{_pcie_throughput}")
+    t.add_row("PCIe",   _pcie_throughput.strip())
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
@@ -1381,6 +1377,13 @@ class MAGIApp(App):
             t = threading.Thread(target=self._eventlog_poller, daemon=True, name="evtlog")
             t.start()
 
+        # HWiNFO64 周期性重启状态机（0=空闲, 1=已强杀等待, 2=已启动等待验证）
+        # 首次触发锚定开机时间 + 11h40m；脚本晚于该时刻启动则下次检查即触发
+        self._hwinfo_next_restart: float = state.boot_time + HWiNFO_RESTART_INTERVAL
+        self._hwinfo_phase: int = 0
+        self._hwinfo_wait_since: float = 0.0
+        self._hwinfo_failed_warned: bool = False
+
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
@@ -1388,7 +1391,7 @@ class MAGIApp(App):
         self._collect()
 
         # 在主线程中处理 alert 和刷新（替代 worker 中的 call_from_thread）
-        self._check_alert(state.cpu_temp, state.gpu_temp)
+        self._check_alert()
         self._flush_eventlog_alerts()
         self._refresh_all()
 
@@ -1471,6 +1474,14 @@ class MAGIApp(App):
         state.prochot_cpu = bool(pc and parse_n(pc) > 0)
         state.prochot_ext = bool(pe and parse_n(pe) > 0)
 
+        # CPU TDC/EDC 电流限制占用率（HWiNFO 百分比）
+        tdc = scanner.get_val("CPU TDC Limit", "%")
+        edc = scanner.get_val("CPU EDC Limit", "%")
+        if tdc is not None:
+            state.cpu_tdc_pct = parse_n(tdc)
+        if edc is not None:
+            state.cpu_edc_pct = parse_n(edc)
+
         fan_cpu = scanner.get_val("CPUFANIN0", "RPM")
         if fan_cpu: state.cpu_fan = fan_cpu
 
@@ -1500,11 +1511,6 @@ class MAGIApp(App):
         mem_junc = scanner.get_val("GPU Memory Junction Temperature", "°C", hw_contains="nvidia")
         if mem_junc is not None:
             state.gpu_mem_junc_temp = parse_n(mem_junc)
-
-        # PCIe 行改为显示链路速率（GT/s），HWiNFO 无 Rx/Tx 吞吐量
-        pcie_ls = scanner.get_val("PCIe Link Speed", "GT/s", hw_contains="nvidia")
-        if pcie_ls is not None:
-            state.pcie_link_gts = parse_n(pcie_ls)
 
         fan_gpu = scanner.get_val("GPU Fan1", "RPM", hw_contains="nvidia")
         if fan_gpu: state.gpu_fan = fan_gpu
@@ -1610,12 +1616,74 @@ class MAGIApp(App):
 
     @work(thread=True, exclusive=True)
     def _collect_slow_tasks(self) -> None:
-        """5s tick：TCP/进程/天气/外网IP——worker 线程低频，避免阻塞主线程"""
+        """5s tick：TCP/进程/天气/外网IP/HWiNFO64 定时重启——worker 线程低频，避免阻塞主线程"""
         state.update_top_process()
         state.update_swap()
         state.update_weather()  # HTTP (wttr.in) 每30分钟更新
         state.update_external_ip()  # HTTP (api.ipify.org) 每30分钟更新
         state.update_tcp_counts()
+        self._hwinfo_restart_tick()
+
+    # ── HWiNFO64 周期性重启 ────────────────────────────────────────────────
+
+    def _hwinfo_alive(self) -> bool:
+        """HWiNFO64 进程是否存在（避免 taskkill 返回码的权限歧义）"""
+        try:
+            return any(p.name().lower() == HWiNFO_PROC_NAME.lower()
+                       for p in psutil.process_iter(["name"]))
+        except Exception:
+            return False
+
+    def _hwinfo_restart_tick(self) -> None:
+        """三阶段状态机：定时强杀 HWiNFO64 → 等待 5s → 重启 → 验证。
+        规避 HWiNFO 共享内存约 12 小时停更的问题。需提升权限运行方可强杀。
+        """
+        now = time.time()
+        if self._hwinfo_phase == 0:
+            # 空闲：到达重启时刻则强杀
+            if now < self._hwinfo_next_restart:
+                return
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", HWiNFO_PROC_NAME],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
+            if self._hwinfo_alive():
+                # 强杀失败（通常是无管理员权限，进程仍在运行）
+                if not self._hwinfo_failed_warned:
+                    self._hwinfo_failed_warned = True
+                    self.notify("[bold][red]⚠️  HWiNFO64 强杀失败（需管理员权限），跳过本轮重启", severity="warning", timeout=8)
+                self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
+                return
+            self.notify("[bold][#FFD700]⚠️  HWiNFO64 定时重启：已终止，稍后自动启动", timeout=5)
+            self._hwinfo_phase = 1
+            self._hwinfo_wait_since = now
+            return
+        if self._hwinfo_phase == 1:
+            # 已强杀：等待 5s 后启动（若期间自行恢复则跳过启动）
+            if now - self._hwinfo_wait_since < HWiNFO_KILL_WAIT_SEC:
+                return
+            if not self._hwinfo_alive():
+                try:
+                    subprocess.Popen([HWiNFO_EXE_PATH])
+                except Exception:
+                    if not self._hwinfo_failed_warned:
+                        self._hwinfo_failed_warned = True
+                        self.notify("[bold][red]⚠️  HWiNFO64 启动失败", severity="warning", timeout=8)
+            self._hwinfo_phase = 2
+            self._hwinfo_wait_since = now
+            return
+        if self._hwinfo_phase == 2:
+            # 已启动：等待 3s 验证进程存在，然后进入下一周期
+            if now - self._hwinfo_wait_since < HWiNFO_LAUNCH_WAIT_SEC:
+                return
+            if not self._hwinfo_alive() and not self._hwinfo_failed_warned:
+                self._hwinfo_failed_warned = True
+                self.notify("[bold][red]⚠️  HWiNFO64 重启后未检测到进程", severity="warning", timeout=8)
+            self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
+            self._hwinfo_phase = 0
+            self._hwinfo_failed_warned = False
+            return
 
     # ── 日志定时器 ────────────────────────────────────────────────────────────
 
@@ -1669,7 +1737,6 @@ class MAGIApp(App):
                 f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
                 f"{s.current_gpu_power:.1f},{_gfreq_last:.0f},"
                 f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},{s.gpu_pstate},"
-                f"{s.pcie_link_gts:.3f},"
                 f"{s.psu_v:.3f},{s.v3vc:.3f},"
                 f"{s.top_proc_name},{s.top_proc_cpu:.0f},"
                 f"{s.gpu_decoder_util:.0f},{s.gpu_encoder_util:.0f},{s.gpu_mem_util:.0f},"
@@ -1713,17 +1780,19 @@ class MAGIApp(App):
 
     # ── 警报 ───────────────────────────────────────────────────────────
         
-    def _check_alert(self, cpu_temp: float, gpu_temp: float) -> None:
-        old_level, new_level = state.update_alert(cpu_temp, gpu_temp)
+    def _check_alert(self) -> None:
+        old_level, new_level = state.update_alert()
 
         # 只在新等级比旧等级高，或距离上次通知超过 30 秒时通知
         now = time.time()
         if new_level > 0 and (new_level > old_level or now - state.last_alert_time > 30):
             state.last_alert_time = now
-            if new_level == 2:
-                self.notify("[bold][red][ !! ANGEL DETECTED !! ]  MAGI SYSTEM — PATTERN BLUE CONFIRMED", severity="error", timeout=10)
+            if state.prochot_cpu and state.prochot_ext:
+                self.notify("[bold][red][ !! CRITICAL OVERHEAT !! ]  PROCHOT CPU+EXT — 内核与供电同时过热降频", severity="error", timeout=10)
+            elif state.prochot_cpu:
+                self.notify("[bold][red]⚠️  CPU THROTTLE — 内核过热降频", severity="warning", timeout=5)
             else:
-                self.notify("[bold][#FFD700]⚠️  HIGH TEMPERATURE DETECTED", severity="warning", timeout=5)
+                self.notify("[bold][#FFD700]⚠️  VRM THROTTLE — 供电过热降频", severity="warning", timeout=5)
 
     # ── Windows 事件日志监控 ────────────────────────────────────────────
 
