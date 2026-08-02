@@ -4,9 +4,10 @@ MAGI SYSTEM Monitor — Textual Edition
 MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CSS 布局）
 """
 
-import os
 import platform as _platform
 import re
+import struct
+import socket
 import subprocess
 import time
 import threading
@@ -24,6 +25,8 @@ except ImportError:
 
 import psutil
 import requests
+import ctypes
+from ctypes import wintypes
 from rich.align import Align
 from rich.panel import Panel
 from rich.table import Table
@@ -48,6 +51,9 @@ from pynvml import (
     nvmlClocksEventReasonHwThermalSlowdown,
     nvmlClocksEventReasonSwPowerCap,
     nvmlClocksEventReasonHwPowerBrakeSlowdown,
+    nvmlDeviceGetPcieThroughput,
+    NVML_PCIE_UTIL_RX_BYTES,
+    NVML_PCIE_UTIL_TX_BYTES,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,12 +81,12 @@ LOG_FILE = "logs/crash_log.csv"
 LOG_MAX_BYTES = 512 * 1024         # 512 KB
 LOG_COLUMNS = [
     "time","cpu_load","cpu_temp","cpu_pkg_w","cpu_eff_freq","cstate","cpu_fan",
-    "cpu_vid1","cpu_vid2","cpu_vid3","cpu_vid4","cpu_vid5","cpu_vid6","cpu_vid7","cpu_vid8",
-    "mem_pct","mem_temp",
+    "cpu_vddcr_v",
+    "mem_pct","mem1_temp","mem2_temp",
     "nvme1_temp","nvme2_temp","sata_temp",
     "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status","gpu_pstate",
-    "pcie_rx","pcie_tx",
-    "v3v3","vcore_v",
+    "pcie_link_gts",
+    "psu_v","v3vc",
     "top_proc","top_cpu",
     "gpu_decoder_util","gpu_encoder_util","gpu_mem_util","gpu_clk_reasons"
 ]
@@ -95,18 +101,21 @@ class MagiState:
     CPU_FREQ_HISTORY_MAX = 1500   # 覆盖约 5 分钟（5 点/秒）
     GPU_FREQ_HISTORY_MAX = 1500   # 与 CPU 统一
     IGPU_LOAD_HISTORY_MAX = 100   # 覆盖约 20 秒（0.2s/点），突变更灵敏
-    GPU_MEM_HISTORY_MAX = 100     # 覆盖约 100 秒（1s/点）
     DISK_HISTORY_MAX = 300        # 覆盖约 1 分钟（0.2s/点）
     
     def __init__(self):
         # CPU
         self.cpu_load = 0.0
         self.cpu_freq_history: list[float] = []
-        self.avg_volt = 0.0
+        self.cpu_vddcr_v = 0.0
+        self.cpu_vdsoc_v = 0.0
+
+        # PROCHOT 降频信号（HWiNFO thermal throttling，0=正常 1=触发）
+        self.prochot_cpu: bool = False   # CPU 内部 DTS 过热（TjMax 89°C 触及）
+        self.prochot_ext: bool = False   # 外部拉低（主板 VRM/外围过热）
         self.current_cpu_power = 0.0
         self.cpu_temp = 0.0
         self.cpu_fan = "0"
-        self.cpu_vids: list[float] = [0.0] * 8
         self.cpu_eff_freq: float = 0.0
         self.cpu_freq_nom: float = 0.0
         self.cpu_freq_session_min: float = float('inf')
@@ -121,12 +130,12 @@ class MagiState:
         self.gpu_temp = 0.0
         self.gpu_fan = "0"
         self.gpu_mem_junc_temp: float = 0.0
-        self.pcie_rx_mbs: float = 0.0
-        self.pcie_tx_mbs: float = 0.0
+        self.pcie_link_gts: float = 0.0   # HWiNFO: PCIe Link Speed (GT/s)
+        self.pcie_rx_bps: float = 0.0   # pynvml: PCIe RX 吞吐 (bytes/s)
+        self.pcie_tx_bps: float = 0.0   # pynvml: PCIe TX 吞吐 (bytes/s)
         self.gpu_pstate: str = "P?"
         self.gpu_freq_session_min: float = float('inf')
         self.gpu_freq_session_max: float = 0.0
-        self.gpu_mem_util_history: list[float] = []
 
         # iGPU（7800X3D 核显，驱动副屏）
         self.igpu_load = 0.0
@@ -145,6 +154,8 @@ class MagiState:
         self.weather: str          = "LOADING..."
         self.disk_history: list[float] = []
         self.last_weather_update: float = 0.0
+        self.aux_fan1 = "0"
+        self.aux_fan2 = "0"
 
         # Swap
         self.swap_pct: float = 0.0
@@ -164,12 +175,16 @@ class MagiState:
         self.disk_r: float = 0.0
         self.disk_w: float = 0.0
         self.ping_ms: float = 0.0
-        self.mem_temp: float = 0.0
+        self.ip_external: str = ""      # 外网公网 IP（api.ipify.org，30min 刷新）
+        self.last_ip_update: float = 0.0
+        self.mem1_temp: float = 0.0
+        self.mem2_temp: float = 0.0
         self.nvme1_temp: float = 0.0   # WD_BLACK SN850X
         self.nvme2_temp: float = 0.0   # SPCC M.2 PCIe SSD
         self.sata_temp: float = 0.0    # WD Blue SA510
-        self.v3v3: float = 0.0
-        self.vcore_v: float = 0.0
+        self.psu_v: float = 0.0
+        self.v3vc: float = 0.0
+        self.whea_errors: float = 0.0   # HWiNFO: Windows Hardware Errors (WHEA)
 
         # C-State / GPU 状态 / 最高 CPU 进程
         self.cpu_cstate_level: str = "C?"
@@ -311,17 +326,6 @@ class MagiState:
                 self.igpu_load_history = self.igpu_load_history[-self.IGPU_LOAD_HISTORY_MAX:]
 
     @property
-    def gpu_mem_util_snapshot(self) -> list[float]:
-        with self._list_lock:
-            return list(self.gpu_mem_util_history)
-
-    def add_gpu_mem_util(self, val: float):
-        with self._list_lock:
-            self.gpu_mem_util_history.append(val)
-            if len(self.gpu_mem_util_history) > self.GPU_MEM_HISTORY_MAX:
-                self.gpu_mem_util_history = self.gpu_mem_util_history[-self.GPU_MEM_HISTORY_MAX:]
-
-    @property
     def disk_snapshot(self) -> list[float]:
         with self._list_lock:
             return list(self.disk_history)
@@ -377,6 +381,16 @@ class MagiState:
             except Exception:
                 self.weather = "OFFLINE"
 
+    def update_external_ip(self):
+        """外网公网 IP（HTTP 探针，每 30min 刷新一次，与天气共用低频节奏）"""
+        if time.time() - self.last_ip_update > 1800:
+            try:
+                res = requests.get("https://api.ipify.org", timeout=1)
+                self.ip_external = res.text.strip()
+                self.last_ip_update = time.time()
+            except Exception:
+                self.ip_external = ""
+
     # ── GPU 运行状态/诊断（pynvml 直调，无子进程） ──
 
     def _update_gpu_nvml(self):
@@ -409,9 +423,11 @@ class MagiState:
             self.gpu_decoder_util = float(dec)
             self.gpu_encoder_util = float(enc)
             self.gpu_mem_util = float(mem_util)
-            self.add_gpu_mem_util(float(mem_util))
 
             self.gpu_clk_reasons = reasons
+
+            self.pcie_rx_bps = nvmlDeviceGetPcieThroughput(h, NVML_PCIE_UTIL_RX_BYTES)
+            self.pcie_tx_bps = nvmlDeviceGetPcieThroughput(h, NVML_PCIE_UTIL_TX_BYTES)
         except Exception:
             self.gpu_status = "?"
             self.gpu_pstate = "P?"
@@ -442,80 +458,239 @@ class MagiState:
 
     # ── PING──────────────────────────────────────────────────
 
-    def update_ping(self, target: str = "8.8.8.8", timeout: int = 1):
-        """执行一次 ping 并提取平均延迟（ms）"""
+    _icmp = None          # iphlpapi 句柄（惰性初始化）
+
+    def _icmp_init(self) -> bool:
+        """惰性初始化 Windows ICMP Echo API（iphlpapi.dll），无需子进程"""
+        if self._icmp is not None:
+            return True
         try:
-            cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), target]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
-            # 匹配 "平均 = 12ms" 或 "Average = 12ms"（中文/英文系统）
-            match = re.search(r"(?:平均|Average)\s*=\s*(\d+)", result.stdout)
-            if match:
-                self.ping_ms = float(match.group(1))
-            else:
-                self.ping_ms = -1.0   # 解析失败
+            k = ctypes.WinDLL("iphlpapi", use_last_error=True)
+            k.IcmpCreateFile.restype = wintypes.HANDLE
+            k.IcmpCreateFile.argtypes = []
+            k.IcmpSendEcho.restype = wintypes.DWORD
+            k.IcmpSendEcho.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                       ctypes.c_void_p, wintypes.WORD,
+                                       ctypes.c_void_p, ctypes.c_void_p,
+                                       wintypes.DWORD, wintypes.DWORD]
+            k.IcmpCloseHandle.restype = wintypes.BOOL
+            k.IcmpCloseHandle.argtypes = [wintypes.HANDLE]
+            h = k.IcmpCreateFile()
+            if not h or h == wintypes.HANDLE(-1).value:
+                return False
+            self._icmp = (k, h)
+            return True
         except Exception:
-            self.ping_ms = -2.0        # 网络错误或超时
+            return False
+
+    def update_ping(self, target: str = "8.8.8.8", timeout: int = 1):
+        """通过 Windows ICMP Echo API 直接测量延迟（ms），无子进程、无 cmd 开销"""
+        icmp = self._icmp
+        if icmp is None:
+            if not self._icmp_init():
+                self.ping_ms = -2.0
+                return
+            icmp = self._icmp
+        k, h = icmp
+        try:
+            # 目标 IP → 网络字节序 uint32（无 DNS，纯 socket 转换）
+            ip = struct.unpack("<I", socket.inet_aton(target))[0]
+            reply = ctypes.create_string_buffer(64)      # IP_ECHO_REPLY(40) + 数据
+            sent = k.IcmpSendEcho(h, ip, None, 0, None,
+                                  ctypes.byref(reply), ctypes.sizeof(reply),
+                                  timeout * 1000)
+            if sent == 0:
+                self.ping_ms = -2.0        # 超时/不可达（IP_STATUS_BASE + 0..2）
+                return
+            # ICMP_ECHO_REPLY: [+0 Address][+4 Status][+8 RoundTripTime]
+            status = struct.unpack_from("<I", reply.raw, 4)[0]
+            rtt    = struct.unpack_from("<I", reply.raw, 8)[0]
+            self.ping_ms = float(rtt) if status == 0 else -1.0
+        except Exception:
+            self.ping_ms = -2.0
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Scanner（OpenHardwareMonitor / LibreHardwareMonitor JSON API）
+#  Scanner（HWiNFO 共享内存读取）
+#  读取 Global\HWiNFO_SENS_SM2 内存映射文件（需 HWiNFO 开启 Shared Memory Support）
 # ══════════════════════════════════════════════════════════════════════════════
+
+FILE_MAP_READ = 0x0004
+HWI_SENS_SM2 = "Global\\HWiNFO_SENS_SM2"
+
+# SENSOR_READING_TYPE 枚举（HWiNFO_SENSORS_READING_ELEMENT.tReading）
+SRT_NONE, SRT_TEMP, SRT_VOLT, SRT_FAN, SRT_CURRENT, SRT_POWER, SRT_CLOCK, SRT_USAGE, SRT_OTHER = range(9)
+
+# HWiNFO_SENSORS_SHARED_MEM2 头（_pack_=1，0x30 字节）:
+#   0x00 4 dwSignature ('HWiS'/'DEAD')
+#   0x04 4 dwVersion
+#   0x08 4 dwRevision
+#   0x0C 8 poll_time
+#   0x14 4 dwOffsetOfSensorSection
+#   0x18 4 dwSizeOfSensorElement
+#   0x1C 4 dwNumSensorElements
+#   0x20 4 dwOffsetOfReadingSection
+#   0x24 4 dwSizeOfReadingElement
+#   0x28 4 dwNumReadingElements
+#   0x2C 4 dwPollingPeriod (rev>=1 才有)
+class _HWiNFOHdr(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("signature", ctypes.c_uint32),
+        ("version",   ctypes.c_uint32),
+        ("revision",  ctypes.c_uint32),
+        ("poll_time", ctypes.c_int64),
+        ("off_sensors",    ctypes.c_uint32),
+        ("size_sensor",    ctypes.c_uint32),
+        ("count_sensors",  ctypes.c_uint32),
+        ("off_readings",   ctypes.c_uint32),
+        ("size_reading",   ctypes.c_uint32),
+        ("count_readings", ctypes.c_uint32),
+        ("poll_period",    ctypes.c_uint32),
+    ]
+
+# 用固定偏移读取数值，不读整个 reading 元素（rev2+ 末尾追加 UTF-8 字段使 sizeof 变大）
+_SEN_OFF_NAME = 0x08          # szSensorNameOrig
+_SEN_NAME_LEN = 128
+_R_OFF_TYPE   = 0x00          # reading 元素: tReading
+_R_OFF_SIDX   = 0x04          # dwSensorIndex
+_R_OFF_LABEL  = 0x0C          # szLabelOrig
+_R_LABEL_LEN  = 128
+_R_OFF_UNIT   = 0x10C         # szUnit
+_R_UNIT_LEN   = 16
+_R_OFF_VALUE  = 0x11C         # double Value
+
 
 class MAGIScanner:
+    """从 HWiNFO 共享内存（Global\\HWiNFO_SENS_SM2）读取传感器快照。
+
+    缓存格式: list[(sensor_lower, label_lower, unit_lower, srt_type, value)]
+    """
+
+    # 全局句柄（惰性初始化)
+    _k32 = None
+
+    @classmethod
+    def _kernel32(cls):
+        if cls._k32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenFileMappingW.restype = wintypes.HANDLE
+            k.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+            k.MapViewOfFile.restype = wintypes.LPVOID
+            k.MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                        wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
+            k.UnmapViewOfFile.restype = wintypes.BOOL
+            k.UnmapViewOfFile.argtypes = [wintypes.LPVOID]
+            k.CloseHandle.restype = wintypes.BOOL
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            cls._k32 = k
+        return cls._k32
+
     def __init__(self):
-        self.url = "http://localhost:8085/data.json"
-        # 预计算的小写名称缓存，避免每次 get_val 重复调用 .lower()
-        self._cache: list[tuple[str, str]] = []
+        # 缓存: list[(sensor_lower, label_lower, unit_lower, srt_type, value)]
+        self._cache: list[tuple[str, str, str, int, float]] = []
+
+    # ── 共享内存快照 ──────────────────────────────────────────────────
 
     def update(self):
+        """读取一份 HWiNFO 共享内存快照；失败则清空缓存（调用方降级为 None）"""
         try:
-            raw = requests.get(self.url, timeout=0.3).json()
-            self._cache = []
-            self._walk(raw)
+            self._cache = self._snapshot()
         except Exception:
             self._cache = []
 
-    def _walk(self, node, hw: str = ""):
-        if "HardwareId" in node:
-            hw = node.get("Text", "")
-        if node.get("Value"):
-            name = f"{hw} {node.get('Text', '')}"
-            val = str(node.get("Value", ""))
-            self._cache.append((name.lower(), val))
-        for child in node.get("Children", []):
-            self._walk(child, hw)
+    def _snapshot(self) -> list[tuple[str, str, str, int, float]]:
+        k = self._kernel32()
+        handle = k.OpenFileMappingW(FILE_MAP_READ, False, HWI_SENS_SM2)
+        if not handle:
+            return []
+        try:
+            base = k.MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0)
+            if not base:
+                return []
+            try:
+                hdr = _HWiNFOHdr()
+                ctypes.memmove(ctypes.byref(hdr), ctypes.c_void_p(base), ctypes.sizeof(hdr))
+                if hdr.signature != 0x53695748:      # 'HWiS' as LE uint32
+                    return []
+                n_sensors = hdr.count_sensors
+                off_s     = hdr.off_sensors
+                size_s    = hdr.size_sensor
+                n_read    = hdr.count_readings
+                off_r     = hdr.off_readings
+                size_r    = hdr.size_reading
+
+                # 读取全部传感器名（按 sensor index 索引）
+                sensor_names: list[str] = []
+                for i in range(n_sensors):
+                    buf = ctypes.string_at(
+                        base + off_s + i * size_s + _SEN_OFF_NAME, _SEN_NAME_LEN)
+                    sensor_names.append(buf.split(b"\0", 1)[0].decode("utf-8", "ignore").lower())
+
+                out: list[tuple[str, str, str, int, float]] = []
+                for i in range(n_read):
+                    p = base + off_r + i * size_r
+                    srt  = ctypes.c_uint32.from_address(p + _R_OFF_TYPE).value
+                    sidx = ctypes.c_uint32.from_address(p + _R_OFF_SIDX).value
+                    label = ctypes.string_at(p + _R_OFF_LABEL, _R_LABEL_LEN).split(b"\0", 1)[0].decode("utf-8", "ignore").lower()
+                    unit  = ctypes.string_at(p + _R_OFF_UNIT, _R_UNIT_LEN).split(b"\0", 1)[0].decode("utf-8", "ignore").lower()
+                    val   = ctypes.c_double.from_address(p + _R_OFF_VALUE).value
+                    sensor = sensor_names[sidx] if sidx < len(sensor_names) else ""
+                    out.append((sensor, label, unit, srt, val))
+                return out
+            finally:
+                k.UnmapViewOfFile(base)
+        finally:
+            k.CloseHandle(handle)
+
+    # ── 查询接口 ──────────────────────────────────────────────────────
 
     def get_val(self, name_target: str, unit_target: str | None = None,
                 hw_contains: str | None = None) -> str | None:
-        """末尾锚定匹配，hw_contains 过滤硬件名（如 'nvidia' 排除 iGPU）"""
+        """末尾锚定匹配读数名；hw_contains 过滤传感器名（如 'nvidia' 排除 iGPU）"""
         pattern = re.compile(r"(?:^|\W)" + re.escape(name_target.lower()) + r"$")
-        for name_lower, val in self._cache:
-            if hw_contains and hw_contains.lower() not in name_lower:
+        for sensor, label, unit, srt, val in self._cache:
+            if hw_contains and hw_contains.lower() not in sensor:
                 continue
-            if pattern.search(name_lower):
-                if unit_target is None or unit_target.lower() in val.lower():
-                    return val
+            if not pattern.search(label):
+                continue
+            if unit_target is not None:
+                if unit and unit_target.lower() not in unit:
+                    continue
+                # 某些单位（温度 °C）HWiNFO 可能为空字符串，按传感器类型兜底
+                if not unit:
+                    type_unit = {SRT_TEMP: "°c", SRT_VOLT: "v", SRT_FAN: "rpm",
+                                 SRT_POWER: "w", SRT_CLOCK: "mhz", SRT_USAGE: "%"}
+                    if unit_target.lower() != type_unit.get(srt, ""):
+                        continue
+            return f"{val:g}"
         return None
 
     def get_core_freq(self, core_id: int) -> tuple[float, float]:
-        """返回 (标称 MHz, 有效 MHz);用 endswith 后缀匹配避免 'Core #1' 误中 'Core #10' / '(Effective)'。"""
-        suf_nom = f"core #{core_id}"
-        suf_eff = f"core #{core_id} (effective)"
-        nom = eff = 0.0
-        for name_lower, val in self._cache:
-            if not nom and name_lower.endswith(suf_nom) and "mhz" in val.lower():
-                nom = parse_n(val)
-            elif not eff and name_lower.endswith(suf_eff) and "mhz" in val.lower():
-                eff = parse_n(val)
-            if nom and eff:
-                break
+        """返回物理核 #core_id (1 起) 的 (标称 MHz, 有效 MHz)。HWiNFO 无 per-core nominal，
+        仅按 'Core {i} Clock'（perf）近似标称；有效 = max('Core {i} T0/T1 Effective')。"""
+        i = core_id - 1
+        nom = 0.0
+        eff = 0.0
+        pref_nom = f"core {i} clock"
+        for sensor, label, unit, _s, v in self._cache:
+            if "cpu" not in sensor:
+                continue
+            if not nom and label.startswith(pref_nom) and ("mhz" in label or unit == "mhz"):
+                nom = v
+            if label.startswith(f"core {i} t") and "effective" in label:
+                eff = max(eff, v)
         return nom, eff
 
     def get_core_load(self, cpu_id: int) -> float:
-        """返回逻辑 CPU #cpu_id 的负载 %;读不到时 0.0。"""
-        suf = f"cpu core #{cpu_id}"
-        for name_lower, val in self._cache:
-            if name_lower.endswith(suf) and "%" in val:
-                return parse_n(val)
+        """返回逻辑 CPU #cpu_id 的负载 %；读不到时 0.0。
+        HWiNFO: 'Core {i}  T0/T1 Usage'（T0 = 逻辑线程前半，T1 = 后半）。
+        """
+        i  = (cpu_id - 1) >> 1
+        t0 = (cpu_id - 1) & 1
+        suf = f"core {i} t{t0} usage"
+        for sensor, label, _u, _s, v in self._cache:
+            if "cpu" in sensor and label.startswith(suf):
+                return v
         return 0.0
 
 
@@ -693,7 +868,7 @@ def build_header() -> Panel:
         f"[bold green]{hostname}[/] [dim]||[/][orange3] {date_str} [/]"
         f"[dim]||[/][orange3] {now} [/][dim]||[/] "
         f"{state.weather} [dim]||[/] "
-        f"[bold red]UP: {uptime}[/] [dim]||[/] 3V3 [cadet_blue]{state.v3v3:.3f} V[/]"
+        f"[bold red]UP: {uptime}[/] [dim]||[/] WHEA [{'green' if state.whea_errors == 0 else 'red1'}]{state.whea_errors:.0f}[/]"
     )
     return Panel(Align.center(txt), border_style="orange3")
 
@@ -715,7 +890,7 @@ def build_melchior() -> Panel:
     else:
         freq_str = "[dim]collecting...[/]"
 
-    # iGPU D3D 3D + Copy 负载点阵
+    # iGPU D3D Usage 负载点阵
     igpu_snapshot = state.igpu_load_snapshot
     spark = generate_braille_trend(
         igpu_snapshot,
@@ -748,9 +923,22 @@ def build_melchior() -> Panel:
     t.add_row("LOAD",   generate_bar(state.cpu_load, color="orange3"))
     t.add_row("FREQ",  freq_str)
     t.add_row("CORES",  build_core_heatmap(state.core_loads))
-    t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.3f} V[/]")
+    t.add_row("V-DDC",  f"[dim]VDD[/][cadet_blue]{state.cpu_vddcr_v:.3f}[/] [dim]SOC[/][cadet_blue]{state.cpu_vdsoc_v:.3f}[/] V")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
-    t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f}[/] [dim]MB[/][bold {get_temp_color(state.mb_temp)}]{state.mb_temp:.0f}[/] °C")
+    t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f}[/] [dim]#1[/][bold {get_temp_color(state.mem1_temp)}]{state.mem1_temp:.0f}[/] [dim]#3[/][bold {get_temp_color(state.mem2_temp)}]{state.mem2_temp:.0f}[/] °C")
+    # ── THRM：PROCHOT 降频状态（CPU 内核过热 / 主板 VRM 过热）──
+    _pc, _pe = state.prochot_cpu, state.prochot_ext
+    if _pc and _pe:
+        on = (time.time() * 5) % 2 < 1
+        thr_str = "[bold red1]CRITICAL OVERHEAT[/]" if on else "[dim]CRITICAL OVERHEAT[/]"
+    elif _pc:
+        on = (time.time() * 5) % 2 < 1
+        thr_str = "[bold red1]CPU THROTTLE[/]" if on else "[dim]CPU THROTTLE[/]"
+    elif _pe:
+        on = (time.time() * 5) % 2 < 1
+        thr_str = "[bold gold1]VRM THROTTLE[/]" if on else "[dim]VRM THROTTLE[/]"
+    else:
+        thr_str = "[cyan]NOMINAL[/]"
     t.add_row("iACTV",  spark)
     # ── iACTV（iGPU GPU Core 利用率，三档着色）──
     _core = state.igpu_core_pct
@@ -760,6 +948,7 @@ def build_melchior() -> Panel:
     else:
         _core_str = "[green]IDLE[/]"
     t.add_row("iGPU", _core_str + f"[dim] | [/][red]{state.igpu_mem:.0f} MB[/]")
+    t.add_row("THRM",  thr_str)
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     _active_color = "cyan" if state.active_cores <= 1 else \
                     "green" if state.active_cores <= 4 else \
@@ -825,6 +1014,7 @@ def build_balthasar() -> Panel:
     else:
         color = "cyan" if p < 30 else "yellow" if p < 80 else "red"
         ping_str = f"[{color}]{p:.0f} ms[/]"
+    ip_str = state.ip_external if state.ip_external else "[dim]--[/]"
 
     tcp_str = f"[#7CFC00]EST:{state.tcp_established}[/] [dim]|[/] [#FFE4B5]TW:{state.tcp_timewait}[/]"
 
@@ -841,17 +1031,18 @@ def build_balthasar() -> Panel:
     _free_color = "green" if _avail > 15 else "yellow" if _avail > 10 else "red1"
     t.add_row("FREE",   f"[bold {_free_color}]{state.avail_gb or 'N/A'}[/]")
     t.add_row("SWAP",   generate_bar(state.swap_pct, color="magenta"))
-    t.add_row("NET-DN", net_display) 
-    t.add_row("PING",   ping_str)
-    _mt = f"[dim]RM[/][bold {get_temp_color(state.mem_temp)}]{state.mem_temp:.0f}[/]"
+    t.add_row("PSU",    f"[dim]12V[/][cadet_blue]{state.psu_v:.3f}[/] [dim]3V3[/][cadet_blue]{state.v3vc:.3f}[/] V")
+    t.add_row("NET-DN", net_display)
     _wd = f"[dim]WD[/][bold {get_temp_color(state.nvme1_temp)}]{state.nvme1_temp:.0f}[/]"
     _sp = f"[dim]SP[/][bold {get_temp_color(state.nvme2_temp)}]{state.nvme2_temp:.0f}[/]"
     _st = f"[dim]ST[/][bold {get_temp_color(state.sata_temp)}]{state.sata_temp:.0f}[/]"
-    t.add_row("MEMTMP",  f"{_mt} {_wd} {_sp} {_st} °C")
+    _mb = f"[dim]MB[/][bold {get_temp_color(state.mb_temp)}]{state.mb_temp:.0f}[/]"
+    t.add_row("SDTMP",  f"{_mb} {_wd} {_sp} {_st} °C")
     _disk_spark = generate_sparkline(state.disk_snapshot, width=22, y_range=(0, 50), low_color="cyan", mid_color="yellow", high_color="red")
     t.add_row("DISK",   _disk_spark)
     t.add_row("TCP",    tcp_str) 
-    t.add_row("PCIe",   f"[#00BFFF]▼{state.pcie_rx_mbs:.0f} MB[/][dim] | [/][#FF4500]▲{state.pcie_tx_mbs:.0f} MB[/]")
+    t.add_row("PING",   f"{ping_str} [dim]IP[/][cyan]{ip_str}[/]")
+    t.add_row("FAN",    f"[dim]CF1[/][indian_red1]{state.aux_fan1}[/] [dim]CF2[/][indian_red1]{state.aux_fan2}[/]")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
     bal_title = f"[bold orange3]BALTHASAR[/] | [bold {_top_color}]{_top_display}[/]"
@@ -902,7 +1093,7 @@ def build_casper() -> Panel:
     t.add_row("LOAD",   generate_bar(state.gpu_load, color="red"))
     t.add_row("FREQ",   freq_display)          # 改用趋势显示
     t.add_row("VRAM",   generate_bar(state.vram_used_pct, color="#4a00f7"))
-    t.add_row("VCORE",  f"[cadet_blue]{state.gpu_volt:.3f} V[/]")
+    t.add_row("VCORE",  f"[dim]CO[/][cadet_blue]{state.gpu_volt:.3f}[/] V")
     t.add_row("TGP",  f"[#4169E1]{state.current_gpu_power:.1f} W [dim]|[/][bold cyan] {state.gpu_pstate}[/]")
     t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.gpu_temp)}]{state.gpu_temp:.0f}[/] [dim]MJ[/][bold {get_temp_color(state.gpu_mem_junc_temp)}]{state.gpu_mem_junc_temp:.0f}[/] °C")
     # ── MBUS（显存带宽利用率信号条 + 百分比，pynvml）──
@@ -920,6 +1111,27 @@ def build_casper() -> Panel:
         _parts.append("[bold yellow]ENCODING[/]" if on else "[dim]ENCODING[/]")
     _vcodec_str = " [dim]|[/] ".join(_parts) if _parts else "[green]IDLE[/]"
     t.add_row("CODEC", _vcodec_str)
+    _pcie_gts = state.pcie_link_gts
+    _pcie_color = "green" if _pcie_gts >= 16.0 else "yellow" if _pcie_gts >= 8.0 else "cyan"
+    _pcie_throughput = ""
+    for _arrow, _bps in (("▼", state.pcie_rx_bps), ("▲", state.pcie_tx_bps)):
+        _v = _bps / 1000.0
+        if _v >= 1024 * 1024:
+            _s = f"{_v / 1024 / 1024:.1f}G"
+        elif _v >= 1024:
+            _s = f"{_v / 1024:.1f}M"
+        else:
+            _s = f"{_v:.0f}K"
+        if _bps >= 1024 * 1024 * 1024:
+            _c = "red"
+        elif _bps >= 100 * 1024 * 1024:
+            _c = "yellow"
+        elif _bps >= 1 * 1024 * 1024:
+            _c = "green"
+        else:
+            _c = "dim"
+        _pcie_throughput += f" [{_c}]{_arrow}{_s}[/]"
+    t.add_row("PCIe",   f"[bold {_pcie_color}]{_pcie_gts:.1f} GT/s[/]{_pcie_throughput}")
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
@@ -1157,8 +1369,8 @@ class MAGIApp(App):
             self.query_one(CasperPanel),
         ]
         self.set_interval(0.2, self._tick)        # 高频：传感器（0.2s）
-        self.set_interval(1.0, self._collect_gpu) # 1s：GPU状态/NVML
-        self.set_interval(5.0, self._collect_slow_tasks) # 5s：Ping/TCP/进程
+        self.set_interval(1.0, self._collect_gpu) # 1s：GPU状态/NVML + Ping(ICMP)
+        self.set_interval(5.0, self._collect_slow_tasks) # 5s：TCP/进程/天气
         self.set_interval(1.0, self._log_tick)    # 日志写入（1s）
 
         # 启动 Windows 事件日志监控（后台线程轮询）
@@ -1194,26 +1406,29 @@ class MAGIApp(App):
         exclusive=True 确保上次工作器未完成时跳过新调用。
         """
         now = time.time()
-        if now - self._last_scanner_update >= 0.5:   # OHM 原生 500ms 刷新率
+        if now - self._last_scanner_update >= 0.5:   # HWiNFO 刷新率下限 500ms
             scanner.update()
             self._last_scanner_update = now
 
-        # CPU数据采样
-        load_val = scanner.get_val("CPU Total", "%")
+        # CPU数据采样 (HWiNFO 共享内存)
+        load_val = scanner.get_val("Total CPU Usage", "%")
         if load_val is not None: state.cpu_load = parse_n(load_val)
-        
-        freq_str = scanner.get_val("Cores (Average)", "MHz")
-        if freq_str:
-            f_nom = parse_n(freq_str)
+
+        # 频率历史 = 各物理核 clock (perf) 的平均（近似标称频率）
+        _nom_sum = 0.0
+        for i in range(8):
+            _nom_c, _ = scanner.get_core_freq(i + 1)
+            _nom_sum += _nom_c
+        f_nom = _nom_sum / 8 if _nom_sum > 0 else 0.0
+        if f_nom > 0:
             state.add_cpu_freq(f_nom)
             state.cpu_freq_nom = f_nom
 
-        eff_str = scanner.get_val("Cores (Average Effective)", "MHz")
+        eff_str = scanner.get_val("Average Effective Clock", "MHz")
         if eff_str:
             state.cpu_eff_freq = parse_n(eff_str)
-        if eff_str and freq_str:
-            f_eff = parse_n(eff_str)
-            f_nom = parse_n(freq_str)
+        if f_nom > 0:
+            f_eff = parse_n(eff_str) if eff_str else 0.0
             state.cpu_cstate_level = ratio_to_cstate(f_eff / f_nom) if f_nom > 0 else "C?"
 
         # 每核负载 / C-State / 活跃核心数（复合判定:负载>10% OR 频比>0.15）
@@ -1235,113 +1450,131 @@ class MAGIApp(App):
         state.core_cstates = cstates
         state.active_cores = combined_active
 
-        state.cpu_vids = [
-            parse_n(scanner.get_val(f"Core #{i} VID", "V")) for i in range(1, 9)
-        ]
-        v_list   = [v for v in state.cpu_vids if v > 0]
-        state.avg_volt = sum(v_list) / len(v_list) if v_list else 0.0
-    
-        cpu_pwr = scanner.get_val("Package", "W")
+        # CPU 核心电压：HWiNFO 原生 SVI3 传感器（替代原 8 核 VID 平均）
+        _vddcr = scanner.get_val("CPU VDDCR_VDD Voltage (SVI3 TFN)", "V")
+        state.cpu_vddcr_v = parse_n(_vddcr) if _vddcr else 0.0
+
+        _vdsoc = scanner.get_val("CPU VDDCR_SOC Voltage (SVI3 TFN)", "V")
+        state.cpu_vdsoc_v = parse_n(_vdsoc) if _vdsoc else 0.0
+
+        cpu_pwr = scanner.get_val("CPU Package Power", "W")
         if cpu_pwr is not None:
             state.current_cpu_power = parse_n(cpu_pwr)
 
-        cpu_temp_val = scanner.get_val("Core (Tctl/Tdie)", "°C")
+        cpu_temp_val = scanner.get_val("CPU (Tctl/Tdie)", "°C")
         if cpu_temp_val is not None:
             state.cpu_temp = parse_n(cpu_temp_val)
 
-        fan_cpu = scanner.get_val("Fan #2", "RPM")
+        # PROCHOT 降频信号（0=正常，>0=触发）
+        pc = scanner.get_val("Thermal Throttling (PROCHOT CPU)")
+        pe = scanner.get_val("Thermal Throttling (PROCHOT EXT)")
+        state.prochot_cpu = bool(pc and parse_n(pc) > 0)
+        state.prochot_ext = bool(pe and parse_n(pe) > 0)
+
+        fan_cpu = scanner.get_val("CPUFANIN0", "RPM")
         if fan_cpu: state.cpu_fan = fan_cpu
 
         # GPU数据采样（hw_contains="nvidia" 排除 iGPU 传感器）
-        gpu_load_val = scanner.get_val("GPU Core", "%", hw_contains="nvidia")
+        gpu_load_val = scanner.get_val("GPU Core Load", "%", hw_contains="nvidia")
         if gpu_load_val is not None: state.gpu_load = parse_n(gpu_load_val)
-        
-        gpu_freq_str = scanner.get_val("GPU Core", "MHz", hw_contains="nvidia")
+
+        gpu_freq_str = scanner.get_val("GPU Clock", "MHz", hw_contains="nvidia")
         if gpu_freq_str:
             state.add_gpu_freq(parse_n(gpu_freq_str))
 
-        v_used = parse_n(scanner.get_val("GPU Memory Used", "MB", hw_contains="nvidia"))
-        v_total = parse_n(scanner.get_val("GPU Memory Total", "MB", hw_contains="nvidia"))
-        state.vram_used_pct = (v_used / v_total * 100) if v_total > 0 else 0.0
+        gpu_mem_pct = scanner.get_val("GPU Memory Usage", "%", hw_contains="nvidia")
+        if gpu_mem_pct is not None:
+            state.vram_used_pct = parse_n(gpu_mem_pct)
 
         gpu_volt_val = scanner.get_val("GPU Core Voltage", "V", hw_contains="nvidia")
         if gpu_volt_val is not None: state.gpu_volt = parse_n(gpu_volt_val)
 
-        gpu_p_raw = scanner.get_val("GPU Package", "W", hw_contains="nvidia")
+        gpu_p_raw = scanner.get_val("GPU Power", "W", hw_contains="nvidia")
         if gpu_p_raw is not None:
             state.current_gpu_power = parse_n(gpu_p_raw)
-            
-        gpu_temp_val = scanner.get_val("GPU Core", "°C", hw_contains="nvidia")
+
+        gpu_temp_val = scanner.get_val("GPU Temperature", "°C", hw_contains="nvidia")
         if gpu_temp_val is not None:
             state.gpu_temp = parse_n(gpu_temp_val)
 
-        mem_junc = scanner.get_val("GPU Memory Junction", "°C", hw_contains="nvidia")
+        mem_junc = scanner.get_val("GPU Memory Junction Temperature", "°C", hw_contains="nvidia")
         if mem_junc is not None:
             state.gpu_mem_junc_temp = parse_n(mem_junc)
 
-        pcie_rx = scanner.get_val("GPU PCIe Rx", hw_contains="nvidia")
-        if pcie_rx:
-            state.pcie_rx_mbs = parse_n(pcie_rx)
-        pcie_tx = scanner.get_val("GPU PCIe Tx", hw_contains="nvidia")
-        if pcie_tx:
-            state.pcie_tx_mbs = parse_n(pcie_tx)
+        # PCIe 行改为显示链路速率（GT/s），HWiNFO 无 Rx/Tx 吞吐量
+        pcie_ls = scanner.get_val("PCIe Link Speed", "GT/s", hw_contains="nvidia")
+        if pcie_ls is not None:
+            state.pcie_link_gts = parse_n(pcie_ls)
 
-        fan_gpu = scanner.get_val("GPU Fan", "RPM", hw_contains="nvidia")
+        fan_gpu = scanner.get_val("GPU Fan1", "RPM", hw_contains="nvidia")
         if fan_gpu: state.gpu_fan = fan_gpu
 
-        # iGPU 数据采样（D3D 3D + D3D Copy 合并点阵 + GPU Core % 单独显示，hw_contains="radeon"）
-        igpu_d3d = scanner.get_val("D3D 3D", "%", hw_contains="radeon")
-        igpu_copy = scanner.get_val("D3D Copy", "%", hw_contains="radeon")
-        igpu_codec = scanner.get_val("D3D Video Codec 0", "%", hw_contains="radeon")
-        if igpu_d3d is not None or igpu_copy is not None or igpu_codec is not None:
+        # iGPU 数据采样（D3D Usage 点阵 + GPU Utilization 单独显示，hw_contains="radeon"）
+        igpu_d3d = scanner.get_val("GPU D3D Usage", "%", hw_contains="radeon")
+        igpu_codec = scanner.get_val("GPU Video Decode 0 Usage", "%", hw_contains="radeon")
+        if igpu_d3d is not None or igpu_codec is not None:
             combined = (parse_n(igpu_d3d) if igpu_d3d else 0.0) \
-                     + (parse_n(igpu_copy) if igpu_copy else 0.0) \
                      + (parse_n(igpu_codec) if igpu_codec else 0.0)
             state.igpu_load = min(combined, 100.0)
             state.add_igpu_load(state.igpu_load)
-        # iCORE 行单独使用 GPU Core 利用率
-        igpu_core_str = scanner.get_val("GPU Core", "%", hw_contains="radeon")
+        # iCORE 行单独使用 GPU Utilization
+        igpu_core_str = scanner.get_val("GPU Utilization", "%", hw_contains="radeon")
         state.igpu_core_pct = parse_n(igpu_core_str) if igpu_core_str else 0.0
-        igpu_mem = parse_n(scanner.get_val("GPU Memory Used", "MB", hw_contains="radeon"))
+        igpu_mem = parse_n(scanner.get_val("GPU D3D Memory Dedicated", "MB", hw_contains="radeon"))
         if igpu_mem is not None:
             state.igpu_mem = parse_n(igpu_mem)
 
         # 其他数据
-        mb_temp = scanner.get_val("Temperature #1", "°C", hw_contains="Nuvoton")
+        fan_aux1 = scanner.get_val("AUXFANIN1", "RPM")
+        if fan_aux1: state.aux_fan1 = fan_aux1
+        fan_aux2 = scanner.get_val("AUXFANIN4", "RPM")
+        if fan_aux2: state.aux_fan2 = fan_aux2
+
+        mb_temp = scanner.get_val("Motherboard", "°C", hw_contains="nuvoton")
         if mb_temp is not None:
             state.mb_temp = parse_n(mb_temp)
 
-        mem_p = scanner.get_val("Total Memory Memory", "%")
+        mem_p = scanner.get_val("Physical Memory Load", "%")
         if mem_p is not None: state.used_p = parse_n(mem_p)
-        
-        used_gb = scanner.get_val("Total Memory Memory Used", "GB")
-        if used_gb: state.used_gb = used_gb
-        
-        avail_gb = scanner.get_val("Total Memory Memory Available", "GB")
-        if avail_gb: state.avail_gb = avail_gb
-        
-        net_val = scanner.get_val("イーサネット Download Speed")
-        if net_val: state.net_dn_raw = net_val
+
+        used_gb = scanner.get_val("Physical Memory Used", "MB")
+        if used_gb:
+            state.used_gb = f"{parse_n(used_gb) / 1024:.0f} GB"
+
+        avail_gb = scanner.get_val("Physical Memory Available", "MB")
+        if avail_gb:
+            state.avail_gb = f"{parse_n(avail_gb) / 1024:.0f} GB"
+
+        net_val = scanner.get_val("Current DL Rate", "KB/s", hw_contains="rtl8125")
+        if net_val:
+            state.net_dn_raw = f"{parse_n(net_val):.2f} KB/s"
 
         # 日志用传感器
-        dimm_t = scanner.get_val("DIMM #1", "°C")
+        dimm_t = scanner.get_val("SPD Hub Temperature", "°C", hw_contains="DIMM [#1]")
         if dimm_t is not None:
-            state.mem_temp = parse_n(dimm_t)
-        nv1_t = scanner.get_val("Temperature", "°C", hw_contains="sn850x")
+            state.mem1_temp = parse_n(dimm_t)
+        dimm_t2 = scanner.get_val("SPD Hub Temperature", "°C", hw_contains="DIMM [#3]")
+        if dimm_t2 is not None:
+            state.mem2_temp = parse_n(dimm_t2)
+        nv1_t = scanner.get_val("Drive Temperature", "°C", hw_contains="sn850x")
         if nv1_t is not None:
             state.nvme1_temp = parse_n(nv1_t)
-        nv2_t = scanner.get_val("Temperature", "°C", hw_contains="spcc")
+        nv2_t = scanner.get_val("Drive Temperature", "°C", hw_contains="spcc")
         if nv2_t is not None:
             state.nvme2_temp = parse_n(nv2_t)
-        sata_t = scanner.get_val("Temperature", "°C", hw_contains="sa510")
+        sata_t = scanner.get_val("Drive Temperature", "°C", hw_contains="sa510")
         if sata_t is not None:
             state.sata_temp = parse_n(sata_t)
-        v3 = scanner.get_val("+3.3V", "V")
-        if v3 is not None:
-            state.v3v3 = parse_n(v3)
-        vc = scanner.get_val("Vcore", "V")
-        if vc is not None:
-            state.vcore_v = parse_n(vc)
+
+        psu = scanner.get_val("GPU PCIe +12V Input Voltage", "V")
+        if psu is not None:
+            state.psu_v = parse_n(psu)
+        v3vc = scanner.get_val("+3.3V (3VCC)", "V")
+        if v3vc is not None:
+            state.v3vc = parse_n(v3vc)
+        whea = scanner.get_val("Total Errors", hw_contains="whea")
+        if whea is not None:
+            state.whea_errors = parse_n(whea)
 
         # 解析下载速度并记录最大值（从 render 中移至此，避免重复调用）
         dn_match = re.search(r"([0-9,.]+)\s*(KB|MB|GB)/s?", state.net_dn_raw, re.IGNORECASE)
@@ -1371,15 +1604,17 @@ class MAGIApp(App):
 
     @work(thread=True, exclusive=True)
     def _collect_gpu(self) -> None:
-        """1s tick：GPU 状态/诊断（pynvml 直调，无子进程）"""
+        """1s tick：GPU 状态/诊断（pynvml 直调，无子进程）+ Ping（ICMP 直调，阻塞最多1s 在 worker 线程）"""
         state._update_gpu_nvml()
+        state.update_ping()  # ICMP 开销极小，随 GPU 1s 频率轮询（不可达时阻塞1s，但已在 worker 线程）
 
+    @work(thread=True, exclusive=True)
     def _collect_slow_tasks(self) -> None:
-        """5s tick：Ping/TCP/进程/天气——保持低频"""
+        """5s tick：TCP/进程/天气/外网IP——worker 线程低频，避免阻塞主线程"""
         state.update_top_process()
         state.update_swap()
-        state.update_ping()
         state.update_weather()  # HTTP (wttr.in) 每30分钟更新
+        state.update_external_ip()  # HTTP (api.ipify.org) 每30分钟更新
         state.update_tcp_counts()
 
     # ── 日志定时器 ────────────────────────────────────────────────────────────
@@ -1402,7 +1637,7 @@ class MAGIApp(App):
                 lines = []
             if len(lines) > 1:
                 now_ts = time.time()
-                keep = [lines[0]]  # header
+                keep = [",".join(LOG_COLUMNS)]  # header：与当前 LOG_COLUMNS 强制对齐
                 for line in lines[1:]:
                     parts = line.split(",", 1)
                     if len(parts) > 1:
@@ -1423,24 +1658,26 @@ class MAGIApp(App):
         try:
             t = datetime.now().strftime("%m-%d %H:%M:%S")
             s = state
+            _gfreq = s.get_gpu_freq_snapshot(1)
+            _gfreq_last = _gfreq[-1] if _gfreq else 0.0
             row = (
                 f"{t},{s.cpu_load:.1f},{s.cpu_temp:.1f},{s.current_cpu_power:.1f},"
                 f"{s.cpu_eff_freq:.0f},{s.cpu_cstate_level},{s.cpu_fan},"
-                f"{','.join(f'{v:.3f}' for v in s.cpu_vids)},"
-                f"{s.used_p:.1f},{s.mem_temp:.1f},"
+                f"{s.cpu_vddcr_v:.3f},"
+                f"{s.used_p:.1f},{s.mem1_temp:.1f},{s.mem2_temp:.1f},"
                 f"{s.nvme1_temp:.1f},{s.nvme2_temp:.1f},{s.sata_temp:.1f},"
                 f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
-                f"{s.current_gpu_power:.1f},{s.gpu_freq_history[-1] if s.gpu_freq_history else 0:.0f},"
+                f"{s.current_gpu_power:.1f},{_gfreq_last:.0f},"
                 f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},{s.gpu_pstate},"
-                f"{s.pcie_rx_mbs:.1f},{s.pcie_tx_mbs:.1f},"
-                f"{s.v3v3:.3f},{s.vcore_v:.3f},"
+                f"{s.pcie_link_gts:.3f},"
+                f"{s.psu_v:.3f},{s.v3vc:.3f},"
                 f"{s.top_proc_name},{s.top_proc_cpu:.0f},"
                 f"{s.gpu_decoder_util:.0f},{s.gpu_encoder_util:.0f},{s.gpu_mem_util:.0f},"
                 f"{s.gpu_clk_reasons}\n"
             )
             exists = log_path.exists()
             with log_path.open("a", encoding="utf-8", newline="") as f:
-                if not exists:
+                if not exists or f.tell() == 0:
                     f.write(",".join(LOG_COLUMNS) + "\n")
                 f.write(row)
 

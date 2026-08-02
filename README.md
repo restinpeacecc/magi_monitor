@@ -74,12 +74,12 @@ if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
 
 ### iGPU 共存
 
-CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器（`GPU Core`、`GPU Core Voltage` 等）。
-`MAGIScanner.get_val()` 通过 `hw_contains="nvidia"` 参数确保所有 GPU OHM 查询只匹配独显传感器。
+CPU 集成显卡启用后，HWiNFO 会同时报告 iGPU + dGPU 的同名传感器（`GPU Clock`、`GPU Core Voltage` 等）。
+`MAGIScanner.get_val()` 通过 `hw_contains="nvidia"` 参数确保所有 GPU HWiNFO 查询只匹配独显传感器。
 
 ### 外部依赖
 
-- **LibreHardwareMonitor / OpenHardwareMonitor**: 本地 8085 端口 JSON API
+- **HWiNFO**: 共享内存 `Global\HWiNFO_SENS_SM2`（普通权限可读，无需 JSON API）
 - **pynvml (nvidia-ml-py)**: GPU 状态查询（Clocks Event Reasons，直调 nvml.dll）
 - **wttr.in**: 天气（可选，离线显示 OFFLINE）
 
@@ -106,7 +106,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 
 | 定时器 | 周期 | 执行者 | 任务 |
 |--------|------|--------|------|
-| `_tick` | **0.2s** | `@work(thread, exclusive)` | OHM 轮询、psutil、频率历史、警报 |
+| `_tick` | **0.2s** | `@work(thread, exclusive)` | HWiNFO 轮询、psutil、频率历史、警报 |
 | `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU 状态 + 诊断（解码器/编码器/显存利用率） |
 | `_log_tick` | **1s** | 主线程 | CSV 日志追加 (文件 I/O <1ms) |
 | `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top 进程、ping、天气、TCP、swap |
@@ -114,7 +114,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 ### 核心类
 
 - **`MagiState`**: 线程安全的共享状态（标量无锁，历史列表由 `_list_lock` 保护）
-- **`MAGIScanner`**: OHM JSON API 传感器数据采集（支持 `hw_contains` 过滤，GPU 查询传入 `"nvidia"` 排除 iGPU 同名传感器干扰）
+- **`MAGIScanner`**: HWiNFO 共享内存传感器数据采集（ctypes `MapViewOfFile`，支持 `hw_contains` 过滤，GPU 查询传入 `"nvidia"` 排除 iGPU 同名传感器干扰）
 - **`MAGIApp`**: Textual 主应用
 
 ## 📊 面板说明
@@ -125,11 +125,12 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 - LOAD: CPU 使用率进度条
 - FREQ: 频率 + 趋势箭头 + 最小/最大值
 - CORES: 8 核热点图（每核 1 字符，`█` >50% / `░` ≤50%，颜色四级）
-- V-AVG: 平均 VID 电压
+- VDDCR: CPU 核心电压（SVI3 VDDCR_VDD，替代原 8 核 VID 平均）
 - PKG-W: CPU 封装功耗 + C-State
 - TEMP: CPU 温度（颜色编码）
-- iGPU: D3D 3D + D3D Copy 双引擎 Braille 点阵趋势
-- iCORE: iGPU GPU Core 利用率数值显示（>0% 三级着色，IDLE 绿色）
+- PROT: PROCHOT 降频四态（NOMINAL 绿 / CPU THROTTLE 红 / VRM THROTTLE 金 / CRITICAL OVERHEAT）
+- iGPU: GPU D3D Usage + Video Decode 组合 Braille 点阵趋势
+- iCORE: iGPU GPU Utilization 利用率数值显示（>0% 三级着色，IDLE 绿色）
 - FAN: CPU 风扇转速
 
 ### BALTHASAR (SYSTEM)
@@ -143,7 +144,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 - MEMTMP: 内存 + 硬盘温度，`RM{val} WD{val} SP{val} ST{val} °C` 格式（标签白字、数字着色，RM=内存, WD=SN850X, SP=SPCC, ST=SA510）
 - TCP: EST/TW 连接数
 - DISK: 磁盘总吞吐 Unicode 方块 sparkline（0~200 MB/s，绿→黄→红）
-- PCIe: PCIe 接收/发送速率（MB/s）
+- PCIe: PCIe 链路速率（GT/s，≥16 绿色 / ≥8 黄色）
 
 ### CASPER (GPU)
 - **标题**: `CASPER | {status}`，状态映射：STBY 青、NORM 绿、BOOST 金、PWR 黄、THR 红
@@ -168,7 +169,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 
 ## 📝 崩溃恢复日志
 
-- **文件**: `logs/crash_log.csv`（39 列）
+- **文件**: `logs/crash_log.csv`（38 列）
 - **周期**: 每秒追加
 - **窗口**: 启动时裁剪到最近 30 分钟
 - **封顶**: 512KB，超出时保留前半行数
@@ -176,8 +177,8 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 
 ## ⚠️ 注意事项
 
-1. 需要管理员权限读取部分硬件传感器
-2. LibreHardwareMonitor 需预先运行并开启 Web Server（端口 8085）
+1. 需要管理员权限仅用于读取 Windows System 事件日志（传感器读取无需提权）
+2. HWiNFO 需预先运行并开启共享内存（`Global\HWiNFO_SENS_SM2`）
 3. weather 服务依赖网络连接
 4. 首次调用 `psutil.cpu_percent()` 返回 0.0，有效数据在第二次 5s 后出现
 
@@ -193,7 +194,7 @@ CPU 集成显卡启用后，OHM 会同时报告 iGPU + dGPU 的同名传感器�
 
 - Evangelion 系列作品启发
 - Textual 社区支持
-- LibreHardwareMonitor 项目
+- HWiNFO 共享内存接口
 - NVIDIA NVML / pynvml 库
 
 ---

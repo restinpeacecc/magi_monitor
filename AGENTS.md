@@ -13,7 +13,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 ## Architecture
 
 - Single-file Textual TUI app (`magi_monitor_MIX.py`), entry point: `MAGIApp().run()`
-- Reads hardware sensors from **OpenHardwareMonitor / LibreHardwareMonitor** JSON API at `http://localhost:8085/data.json` via `MAGIScanner`
+- Reads hardware sensors from **HWiNFO shared memory** (`Global\HWiNFO_SENS_SM2`) via `MAGIScanner` (ctypes `MapViewOfFile`, no admin required, no JSON API)
 - GPU status via **pynvml** (direct `nvml.dll` binding, no subprocess), polled every 1s
 - Windows Event Log monitoring via **pywin32** (`win32evtlog`), polled in a background thread every 5s
 - Requires `psutil`, `requests`, `nvidia-ml-py`, `pywin32` (no `pyproject.toml` / `requirements.txt` — install manually)
@@ -38,10 +38,10 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 | Timer | Period | Worker | Tasks |
 |-------|--------|--------|-------|
-| `_tick` | **0.2s** | `@work(thread, exclusive)` | OHM sensor polling, psutil, freq history, alerts |
-| `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU status (Clocks Event Reasons) + diagnostics (decoder/encoder/mem util) |
+| `_tick` | **0.2s** | `@work(thread, exclusive)` | HWiNFO sensor polling, psutil, freq history, alerts |
+| `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU status (Clocks Event Reasons) + diagnostics (decoder/encoder/mem util) + Ping (ICMP echo) + PCIe RX/TX throughput |
 | `_log_tick` | **1s** | Main thread | CSV log append (file I/O < 1ms) |
-| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, ping, weather, TCP, swap |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, swap, weather, external IP, TCP |
 
 - **State (`MagiState`) is shared between threads without locks** on scalar fields. Only the freq history lists are protected by `_list_lock`. When modifying state fields, be aware of potential data races.
 
@@ -57,19 +57,20 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 | Panel | Row | Data Source | Notes |
 |-------|-----|-------------|-------|
-| MELCHIOR | TREND | iGPU `D3D 3D + D3D Copy` via OHM `hw_contains="radeon"` | Braille trend, y_range=(0,25), combined sum clamp 100 |
-| MELCHIOR | iCORE | iGPU `GPU Core` via OHM `hw_contains="radeon"` | >0% → green/yellow/red 三级着色, else `IDLE` |
-| MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | Independent from subtitle; driven by CPU boost state |
-| BALTHASAR | MEMTMP | OHM `DIMM #1, Temperature` via `hw_contains="sn850x"/"spcc"/"sa510"` | `RM{val} WD{val} SP{val} ST{val} °C`, 白标签+色数值 |
-| BALTHASAR | PCIe | OHM `GPU PCIe Rx/Tx` via `hw_contains="nvidia"` | Moved from CASPER, MB/s |
+| MELCHIOR | TREND | iGPU `GPU D3D Usage` via HWiNFO `hw_contains="radeon"` | Braille trend, combined with decode usage, clamp 100 |
+| MELCHIOR | iCORE | iGPU `GPU Utilization` via HWiNFO `hw_contains="radeon"` | >0% → green/yellow/red 三级着色, else `IDLE` |
+| MELCHIOR | PROT | HWiNFO `thermal throttling (prochot cpu/ext)` | NOMINAL / CPU THROTTLE / VRM THROTTLE / CRITICAL OVERHEAT 四态 |
+| MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom`, OR PROCHOT(CPU|EXT) | PROCHOT 任一触发即强制临界闪烁 |
+| BALTHASAR | MEMTMP | HWiNFO `SPD Hub Temperature` + `Drive Temperature` via `hw_contains="sn850x"/"spcc"/"sa510"` | `RM{val} WD{val} SP{val} ST{val} °C`, 白标签+色数值 |
+| BALTHASAR | PCIe | HWiNFO `PCIe Link Speed` (GT/s) via `hw_contains="nvidia"` | PCIe 链路速率, ≥16GT/s green, ≥8GT/s yellow |
 | BALTHASAR | DISK | `psutil.disk_io_counters` R+W 总和 | 方块 sparkline, y_range=(0,200), 绿/黄/红三色 |
 | CASPER | CODEC | pynvml `gpu_decoder_util` / `gpu_encoder_util` | >1% → DECODING/ENCODING blink 5Hz |
-| CASPER | FG | OHM `D3D Optical Flow Accelerator 0` via `hw_contains="nvidia"` | >0% → FG ON (xx%) blink 3Hz, else FG OFF dim |
+| CASPER | FG | HWiNFO (pynvml) 帧生成逻辑 | >0% → FG ON (xx%) blink 3Hz, else FG OFF dim |
 
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
 - **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
-- **Columns** (39 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vid1~8,mem_pct,mem_temp,nvme1_temp,nvme2_temp,sata_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,pcie_rx,pcie_tx,v3v3,vcore_v,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
+- **Columns** (32 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vddcr_v,mem_pct,mem1_temp,mem2_temp,nvme1_temp,nvme2_temp,sata_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,pcie_link_gts,psu_v,v3vc,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
 - **Writing**: `_log_tick()` every 1s, simple `open+append` on main thread
 - **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)
 - **Size cap**: `LOG_MAX_BYTES = 512KB` → auto trims to half when exceeded
@@ -91,18 +92,23 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 ## Design Notes
 
-- **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from OHM `Load/CPU Core #i` (with SMT: max of thread 1+9, 2+10, ...) and `Core #i (Effective)` / `Core #i`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
-- **MELCHIOR TREND row**: Replaced CPU frequency braille trend with iGPU `D3D 3D + D3D Copy` combined load (%) braille trend. `y_range=(0,25)` for responsive display. History window = 100 points (~20s at 0.2s interval).
+- **PROCHOT 降频监控（MELCHIOR PROT 行）**：核心判定以 HWiNFO `thermal throttling (prochot cpu)` 为主（CPU 内部 DTS 触及 TjMax 89°C），`prochot ext` 为辅（主板 VRM/外围拉低）。四态显示：NOMINAL(绿) / CPU THROTTLE(红 reverse，查散热硅脂) / VRM THROTTLE(金 reverse，查风道供电) / CRITICAL OVERHEAT(红 reverse，两者皆触发)。TUI 警报逻辑中二者取逻辑或（OR）强制触发 `fuse_crit` 边框闪烁。
+- **CPU 核心电压直读**：MELCHIOR `V-DDC` 行显示 HWiNFO 原生 SVI3 传感器 `CPU VDDCR_VDD Voltage (SVI3 TFN)`（`state.cpu_vddcr_v`），不再走 8 核 VID 平均（LHM 限制下的权宜之计，平均值无精确度且掩盖真实单核高 VID）。
+- **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from HWiNFO `Core {i} T0/T1 Usage`（SMT: 物理核 i 两线程取 max）和 `Core {i} Clock` / `Core {i} T0/T1 Effective Clock`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
+- **MELCHIOR TREND row**: iGPU `GPU D3D Usage` + `GPU Video Decode 0 Usage` combined load (%) braille trend. History window = 100 points (~20s at 0.2s interval), clamp 100.
 - **MELCHIOR subtitle** uses `fuse_indicator` driven by CPU power + frequency, independent from iGPU state.
 - **MELCHIOR PKG-W shows C-State**: `52.3 W | C0` format, matching CASPER's `TGP | P0` format. Uses original `cpu_cstate_level` from effective/nominal freq ratio.
 - **CASPER TGP shows P-State**: `24.8 W | P0` format. P-State parsed from NVML `Performance State` field.
-- **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `endswith` for additional safety.
-- **iGPU 共存时用 `hw_contains` 过滤**：`get_val()` 支持 `hw_contains` 参数，GPU 查询传入 `"nvidia"` 确保独显传感器不被 iGPU 同名传感器干扰。所有 GPU OHM 查询统一使用此过滤。
+- **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `startswith` for additional safety.
+- **iGPU 共存时用 `hw_contains` 过滤**：`get_val()` 支持 `hw_contains` 参数，GPU 查询传入 `"nvidia"` 确保独显传感器不被 iGPU 同名传感器干扰。所有 GPU HWiNFO 查询统一使用此过滤。
 - **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls the panel border flash (`fuse_crit`). `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications (Toast notify). These serve different UI purposes and should not be unified.
 - **Panel titles are plain text**: After removing the unstable Ollama monitoring feature, panel titles show simple names (MELCHIOR / BALTHASAR / CASPER).
 
 ## Completed Fixes
 
+- **PROCHOT 降频监控（MELCHIOR PROT 行）** — 读 HWiNFO `thermal throttling (prochot cpu/ext)`，四态显示 NOMINAL/CPU THROTTLE/VRM THROTTLE/CRITICAL OVERHEAT；TUI 警报逻辑取二者 OR 强制 `fuse_crit` 边框闪烁
+- **CPU 核心电压改用 HWiNFO 原生 SVI3 传感器** — 移除原 8 核 VID 采集与平均（LHM 限制），切换为 `CPU VDDCR_VDD Voltage (SVI3 TFN)`，MELCHIOR `V-AVG` 行改 `V-DDC` 显示 `cpu_vddcr_v`；crash_log 的 `cpu_vid1~8` 列替换为该单列
+- **LHM JSON API → HWiNFO 共享内存** — 移除 `http://localhost:8085/data.json` 轮询，`MAGIScanner` 改为 ctypes `MapViewOfFile` 读取 `Global\HWiNFO_SENS_SM2`（魔数 `0x53695748`），固定偏移解析 (rev2+ reading 元素勿用 `ctypes.sizeof`)；无需管理员权限；HWiNFO label 全部小写且单位独立于 label 字段；PCIe 行改显示链路速率 `GT/s`；CPU 风扇改用 `CPUFANIN0`；iGPU TREND 改用 `GPU D3D Usage`；iCORE 改用 `GPU Utilization`；网络速率改用 HWiNFO `Current DL Rate`（格式化 `NN KB/s` 兼容下游正则）；crash_log 的 `pcie_rx/pcie_tx` 列替换为 `pcie_link_gts`
 - `build_balthasar()` state mutation in `render()` — moved `state.add_net_dn()` to `_collect()`
 - `MAGIScanner.get_val()` linear search — now uses pre-lowered `list[tuple]` cache
 - `_refresh_all()` repeated `self.query()` — widget references cached in `on_mount()`
@@ -127,8 +133,8 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 - Dead code removed — orphaned `try/return float` after `ratio_to_cstate()` cleaned up
 - FREE 行颜色编码 — 可用内存 >15G green, >10G yellow, ≤10G red1，使用 `parse_n()` 安全解析含单位的字符串
 - GPU polling 从 5s 改为 1s — 新增 `_collect_gpu` 定时器，与原 `_collect_slow_tasks` 拆离，避免 ping/TCP/进程枚举等被连带加速
-- **nvidia-smi 子进程 → pynvml 直调** — 移除两个 `subprocess.run(["nvidia-smi", ...])`，改用 pynvml 直接绑定 `nvml.dll`（无子进程，无 stdout 解析）；OHM(NVAPI) 的 GPU 传感器不动，保留崩溃时数据存活能力；`gpu_recovery_action` 替换为 `gpu_clk_reasons`（Clocks Event Reasons 原始 bitmask）
-- **iGPU 共存 OHM 传感器过滤** — CPU 启用集成显卡后，OHM 同时报告 iGPU + dGPU 同名传感器（GPU Core/MHz/°C 等），`get_val()` 新增 `hw_contains` 参数，所有 GPU 查询传入 `"nvidia"` 确保读取独显数据
+- **nvidia-smi 子进程 → pynvml 直调** — 移除两个 `subprocess.run(["nvidia-smi", ...])`，改用 pynvml 直接绑定 `nvml.dll`（无子进程，无 stdout 解析）；GPU 电源/温度来自 HWiNFO（NVAPI via 共享内存）；`gpu_recovery_action` 替换为 `gpu_clk_reasons`（Clocks Event Reasons 原始 bitmask）
+- **iGPU 共存 HWiNFO 传感器过滤** — CPU 启用集成显卡后，HWiNFO 同时报告 iGPU + dGPU 同名传感器（GPU Clock/MHz/°C 等），`get_val()` 新增 `hw_contains` 参数，所有 GPU 查询传入 `"nvidia"` 确保读取独显数据
 - **iGPU 监控（7800X3D 核显副屏）** — MELCHIOR 面板 TREND 行改用 iGPU `D3D 3D` 负载点阵（`hw_contains="radeon"`，y_range=0~70），subtitle 显示 `D3D Video Codec 0` 四档（40/25/10%）；border flash 保留 CPU 功耗/频率触发逻辑不变
 - **iGPU TREND 双引擎** — D3D 3D + D3D Copy 双引擎负载点阵，移除因 bug 不可用的 Video Codec；GPU Core % 独立显示于 iCORE 行
 - **MELCHIOR iCORE 行** — 原 VCODEC 行替换为 GPU Core 利用率数值显示（>0% 三级着色，=0% 绿色 IDLE）
