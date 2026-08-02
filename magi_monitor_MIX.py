@@ -132,6 +132,7 @@ class MagiState:
         self.igpu_load = 0.0
         self.igpu_load_history: list[float] = []
         self.igpu_core_pct = 0.0
+        self.igpu_mem: float = 0.0
 
         # 其他
         self.mb_temp = 0.0
@@ -689,10 +690,10 @@ def build_header() -> Panel:
     hostname = _platform.node().split(".")[0]
     date_str = datetime.now().strftime("%m/%d (%a)")
     txt = (
-        f"[bold green]MAGI SYSTEM[/] [dim]||[/][orange3] {date_str} [/]"
+        f"[bold green]{hostname}[/] [dim]||[/][orange3] {date_str} [/]"
         f"[dim]||[/][orange3] {now} [/][dim]||[/] "
         f"{state.weather} [dim]||[/] "
-        f"[bold green]{hostname}[/] [dim]||[/] [bold red]UP: {uptime}[/]"
+        f"[bold red]UP: {uptime}[/] [dim]||[/] 3V3 [cadet_blue]{state.v3v3:.3f} V[/]"
     )
     return Panel(Align.center(txt), border_style="orange3")
 
@@ -750,15 +751,15 @@ def build_melchior() -> Panel:
     t.add_row("V-AVG",  f"[cadet_blue]{state.avg_volt:.3f} V[/]")
     t.add_row("PKG-W",  f"[#4169E1]{state.current_cpu_power:.1f} W [dim]|[/][bold cyan] {state.cpu_cstate_level}[/]")
     t.add_row("TEMP",   f"[dim]CO[/][bold {get_temp_color(state.cpu_temp)}]{state.cpu_temp:.0f}[/] [dim]MB[/][bold {get_temp_color(state.mb_temp)}]{state.mb_temp:.0f}[/] °C")
-    t.add_row("iGPU",  spark)
-    # ── iCORE（iGPU GPU Core 利用率，三档着色）──
+    t.add_row("iACTV",  spark)
+    # ── iACTV（iGPU GPU Core 利用率，三档着色）──
     _core = state.igpu_core_pct
     if _core > 0:
         _cc = "green" if _core < 30 else "yellow" if _core < 70 else "red"
         _core_str = f"[bold {_cc}]{_core:.0f}%[/]"
     else:
         _core_str = "[green]IDLE[/]"
-    t.add_row("iCORE", _core_str)
+    t.add_row("iGPU", _core_str + f"[dim] | [/][red]{state.igpu_mem:.0f} MB[/]")
     t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
     _active_color = "cyan" if state.active_cores <= 1 else \
                     "green" if state.active_cores <= 4 else \
@@ -1291,14 +1292,19 @@ class MAGIApp(App):
         # iGPU 数据采样（D3D 3D + D3D Copy 合并点阵 + GPU Core % 单独显示，hw_contains="radeon"）
         igpu_d3d = scanner.get_val("D3D 3D", "%", hw_contains="radeon")
         igpu_copy = scanner.get_val("D3D Copy", "%", hw_contains="radeon")
-        if igpu_d3d is not None or igpu_copy is not None:
+        igpu_codec = scanner.get_val("D3D Video Codec 0", "%", hw_contains="radeon")
+        if igpu_d3d is not None or igpu_copy is not None or igpu_codec is not None:
             combined = (parse_n(igpu_d3d) if igpu_d3d else 0.0) \
-                     + (parse_n(igpu_copy) if igpu_copy else 0.0)
+                     + (parse_n(igpu_copy) if igpu_copy else 0.0) \
+                     + (parse_n(igpu_codec) if igpu_codec else 0.0)
             state.igpu_load = min(combined, 100.0)
             state.add_igpu_load(state.igpu_load)
         # iCORE 行单独使用 GPU Core 利用率
         igpu_core_str = scanner.get_val("GPU Core", "%", hw_contains="radeon")
         state.igpu_core_pct = parse_n(igpu_core_str) if igpu_core_str else 0.0
+        igpu_mem = parse_n(scanner.get_val("GPU Memory Used", "MB", hw_contains="radeon"))
+        if igpu_mem is not None:
+            state.igpu_mem = parse_n(igpu_mem)
 
         # 其他数据
         mb_temp = scanner.get_val("Temperature #1", "°C", hw_contains="Nuvoton")
