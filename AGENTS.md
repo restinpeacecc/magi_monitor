@@ -41,7 +41,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 | `_tick` | **0.2s** | `@work(thread, exclusive)` | HWiNFO sensor polling, psutil, freq history, alerts |
 | `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU status (Clocks Event Reasons) + diagnostics (decoder/encoder/mem util) + Ping (ICMP echo) + PCIe RX/TX throughput |
 | `_log_tick` | **1s** | Main thread | CSV log append (file I/O < 1ms) |
-| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, swap, weather, external IP, TCP |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, swap, weather, external IP, TCP, HWiNFO64 定时重启状态机 |
 
 - **State (`MagiState`) is shared between threads without locks** on scalar fields. Only the freq history lists are protected by `_list_lock`. When modifying state fields, be aware of potential data races.
 
@@ -59,8 +59,8 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 |-------|-----|-------------|-------|
 | MELCHIOR | TREND | iGPU `GPU D3D Usage` via HWiNFO `hw_contains="radeon"` | Braille trend, combined with decode usage, clamp 100 |
 | MELCHIOR | iCORE | iGPU `GPU Utilization` via HWiNFO `hw_contains="radeon"` | >0% → green/yellow/red 三级着色, else `IDLE` |
-| MELCHIOR | PROT | HWiNFO `thermal throttling (prochot cpu/ext)` | NOMINAL / CPU THROTTLE / VRM THROTTLE / CRITICAL OVERHEAT 四态 |
-| MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom`, OR PROCHOT(CPU|EXT) | PROCHOT 任一触发即强制临界闪烁 |
+| MELCHIOR | LIMIT | HWiNFO `CPU TDC Limit` / `CPU EDC Limit` (%) | `LIMIT TDCxx% EDCxx%`，<30 绿 / <70 黄 / ≥70 红 |
+| MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | 50W+4700MHz → CRITICAL 闪烁（与 PROCHOT 警报独立） |
 | BALTHASAR | MEMTMP | HWiNFO `SPD Hub Temperature` + `Drive Temperature` via `hw_contains="sn850x"/"spcc"/"sa510"` | `RM{val} WD{val} SP{val} ST{val} °C`, 白标签+色数值 |
 | BALTHASAR | PCIe | HWiNFO `PCIe Link Speed` (GT/s) via `hw_contains="nvidia"` | PCIe 链路速率, ≥16GT/s green, ≥8GT/s yellow |
 | BALTHASAR | DISK | `psutil.disk_io_counters` R+W 总和 | 方块 sparkline, y_range=(0,200), 绿/黄/红三色 |
@@ -70,7 +70,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
 - **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
-- **Columns** (32 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vddcr_v,mem_pct,mem1_temp,mem2_temp,nvme1_temp,nvme2_temp,sata_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,pcie_link_gts,psu_v,v3vc,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
+- **Columns** (31 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vddcr_v,mem_pct,mem1_temp,mem2_temp,nvme1_temp,nvme2_temp,sata_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,psu_v,v3vc,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
 - **Writing**: `_log_tick()` every 1s, simple `open+append` on main thread
 - **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)
 - **Size cap**: `LOG_MAX_BYTES = 512KB` → auto trims to half when exceeded
@@ -92,7 +92,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 ## Design Notes
 
-- **PROCHOT 降频监控（MELCHIOR PROT 行）**：核心判定以 HWiNFO `thermal throttling (prochot cpu)` 为主（CPU 内部 DTS 触及 TjMax 89°C），`prochot ext` 为辅（主板 VRM/外围拉低）。四态显示：NOMINAL(绿) / CPU THROTTLE(红 reverse，查散热硅脂) / VRM THROTTLE(金 reverse，查风道供电) / CRITICAL OVERHEAT(红 reverse，两者皆触发)。TUI 警报逻辑中二者取逻辑或（OR）强制触发 `fuse_crit` 边框闪烁。
+- **PROCHOT 过热降频警报（Toast）**：核心判定以 HWiNFO `thermal throttling (prochot cpu)` 为主（CPU 内部 DTS 触及 TjMax 89°C），`prochot ext` 为辅（主板 VRM/外围拉低）。`update_alert()` 判定：二者同时触发 → 2 级（CRITICAL OVERHEAT error 通知），任一触发 → 1 级（CPU THROTTLE / VRM THROTTLE warning 通知），30s 去重。边框闪烁（fuse_crit）仍由 CPU 功耗/频率驱动，与 PROCHOT 警报独立。
 - **CPU 核心电压直读**：MELCHIOR `V-DDC` 行显示 HWiNFO 原生 SVI3 传感器 `CPU VDDCR_VDD Voltage (SVI3 TFN)`（`state.cpu_vddcr_v`），不再走 8 核 VID 平均（LHM 限制下的权宜之计，平均值无精确度且掩盖真实单核高 VID）。
 - **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from HWiNFO `Core {i} T0/T1 Usage`（SMT: 物理核 i 两线程取 max）和 `Core {i} Clock` / `Core {i} T0/T1 Effective Clock`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
 - **MELCHIOR TREND row**: iGPU `GPU D3D Usage` + `GPU Video Decode 0 Usage` combined load (%) braille trend. History window = 100 points (~20s at 0.2s interval), clamp 100.
@@ -101,12 +101,14 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 - **CASPER TGP shows P-State**: `24.8 W | P0` format. P-State parsed from NVML `Performance State` field.
 - **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `startswith` for additional safety.
 - **iGPU 共存时用 `hw_contains` 过滤**：`get_val()` 支持 `hw_contains` 参数，GPU 查询传入 `"nvidia"` 确保独显传感器不被 iGPU 同名传感器干扰。所有 GPU HWiNFO 查询统一使用此过滤。
-- **Alert thresholds are intentionally tiered**: `CPU_TEMP_CRITICAL` (70°C) controls the panel border flash (`fuse_crit`). `update_alert()` uses 75°C / 80°C for level 1 / 2 notifications (Toast notify). These serve different UI purposes and should not be unified.
+- **Alert thresholds are intentionally tiered**: 高温 Toast 警报已完全移除，改为 PROCHOT 过热降频警报（见上）。边框闪烁（`fuse_crit`）由 CPU 功耗 + 频率驱动（50W+4700MHz → CRITICAL），与 Toast 警报独立，不应统一。
 - **Panel titles are plain text**: After removing the unstable Ollama monitoring feature, panel titles show simple names (MELCHIOR / BALTHASAR / CASPER).
 
 ## Completed Fixes
 
-- **PROCHOT 降频监控（MELCHIOR PROT 行）** — 读 HWiNFO `thermal throttling (prochot cpu/ext)`，四态显示 NOMINAL/CPU THROTTLE/VRM THROTTLE/CRITICAL OVERHEAT；TUI 警报逻辑取二者 OR 强制 `fuse_crit` 边框闪烁
+- **PROCHOT 降频警报替代高温警报** — 移除 75/80°C 温度 Toast 警报，改为 PROCHOT 信号（`thermal throttling (prochot cpu/ext)`）驱动：双触发 2 级 / 任一 1 级，30s 去重；MELCHIOR 面板原 THRM 行改为 LIMIT 行显示 `CPU TDC/EDC Limit` 百分比
+- **HWiNFO64 周期性重启（规避 12h 共享内存停更）** — `_collect_slow_tasks` 内三阶段状态机：开机 11h40m 首次触发，`taskkill /F` 强杀 → 5s → `Popen` 重启 → 3s 验证；之后每 11h40m 周期执行；scanner 每帧重开映射句柄，重启后自动恢复；强杀失败（无权限）提示一次并顺延
+- **PCIe 吞吐单位修正** — `nvmlDeviceGetPcieThroughput` 原生返回 KB/s，原代码误当 bytes 再除 1000（显示缩小 1000 倍）；`pcie_link_gts`（GT/s 链路速率）意义不大已删除（含 crash_log 列）
 - **CPU 核心电压改用 HWiNFO 原生 SVI3 传感器** — 移除原 8 核 VID 采集与平均（LHM 限制），切换为 `CPU VDDCR_VDD Voltage (SVI3 TFN)`，MELCHIOR `V-AVG` 行改 `V-DDC` 显示 `cpu_vddcr_v`；crash_log 的 `cpu_vid1~8` 列替换为该单列
 - **LHM JSON API → HWiNFO 共享内存** — 移除 `http://localhost:8085/data.json` 轮询，`MAGIScanner` 改为 ctypes `MapViewOfFile` 读取 `Global\HWiNFO_SENS_SM2`（魔数 `0x53695748`），固定偏移解析 (rev2+ reading 元素勿用 `ctypes.sizeof`)；无需管理员权限；HWiNFO label 全部小写且单位独立于 label 字段；PCIe 行改显示链路速率 `GT/s`；CPU 风扇改用 `CPUFANIN0`；iGPU TREND 改用 `GPU D3D Usage`；iCORE 改用 `GPU Utilization`；网络速率改用 HWiNFO `Current DL Rate`（格式化 `NN KB/s` 兼容下游正则）；crash_log 的 `pcie_rx/pcie_tx` 列替换为 `pcie_link_gts`
 - `build_balthasar()` state mutation in `render()` — moved `state.add_net_dn()` to `_collect()`
