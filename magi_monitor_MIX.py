@@ -75,9 +75,15 @@ CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 # HWiNFO64 周期性重启（规避 12 小时共享内存停更问题）
 HWiNFO_RESTART_INTERVAL = 11 * 3600 + 40 * 60   # 42000s = 11h40m
 HWiNFO_KILL_WAIT_SEC    = 5                     # 强杀后等待秒数再启动
-HWiNFO_LAUNCH_WAIT_SEC  = 3                     # 启动后验证进程存在的等待秒数
 HWiNFO_EXE_PATH         = r"C:\Program Files\HWiNFO64\HWiNFO64.EXE"
 HWiNFO_PROC_NAME        = "HWiNFO64.exe"
+HWiNFO_LAUNCH_POLL_IVL  = 1.0                   # 启动后每 1s 轮询验证进程
+HWiNFO_LAUNCH_VERIFY_SEC= 10                    # 启动后验证进程的最大等待秒数
+HWiNFO_MAX_RETRIES      = 5                     # 启动失败最大重试次数
+HWiNFO_RETRY_BACKOFF    = 300                   # 重试耗尽后的退避秒数（替代原先直接等 11h40m）
+HWiNFO_RESTART_LOG      = "logs/hwinfo_restart.log"  # 重启状态机诊断日志
+HWiNFO_RESTART_LOG_MAX_BYTES = 256 * 1024   # 该日志上限 256KB，超限自动裁剪至一半（约几千行）
+HWiNFO_STARTUP_RECOVER_DELAY = 30   # 启动后等待该秒数再执行 HWiNFO 缺席自动拉起（单次）
 
 LOG_DIR = "logs"
 LOG_FILE = "logs/crash_log.csv"
@@ -86,7 +92,7 @@ LOG_COLUMNS = [
     "time","cpu_load","cpu_temp","cpu_pkg_w","cpu_eff_freq","cstate","cpu_fan",
     "cpu_vddcr_v",
     "mem_pct","mem1_temp","mem2_temp",
-    "nvme1_temp","nvme2_temp","sata_temp",
+    "nvme1_temp","nvme2_temp","xhci_temp",
     "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status","gpu_pstate",
         "psu_v","v3vc",
     "top_proc","top_cpu",
@@ -106,6 +112,8 @@ class MagiState:
     DISK_HISTORY_MAX = 300        # 覆盖约 1 分钟（0.2s/点）
     
     def __init__(self):
+        # 提权状态（IsUserAnAdmin，用于重启 HWiNFO64 能力判断）
+        self.is_admin: bool = False
         # CPU
         self.cpu_load = 0.0
         self.cpu_freq_history: list[float] = []
@@ -185,7 +193,7 @@ class MagiState:
         self.mem2_temp: float = 0.0
         self.nvme1_temp: float = 0.0   # WD_BLACK SN850X
         self.nvme2_temp: float = 0.0   # SPCC M.2 PCIe SSD
-        self.sata_temp: float = 0.0    # WD Blue SA510
+        self.xhci_temp: float = 0.0    # WD Blue SA510
         self.psu_v: float = 0.0
         self.v3vc: float = 0.0
         self.whea_errors: float = 0.0   # HWiNFO: Windows Hardware Errors (WHEA)
@@ -757,7 +765,7 @@ def get_temp_color(temp_val) -> str:
 
 def get_lim_color(val: float) -> str:
     """TDC/EDC 限制占用率变色（与 iGPU 使用率一致：<30 绿 / <70 黄 / ≥70 红）"""
-    return "green" if val < 30 else "yellow" if val < 70 else "red"
+    return "cyan" if val < 10 else "green" if val < 30 else "yellow" if val < 70 else "red"
 
 def get_power_theme(value_str, safe_limit, warn_limit, crit_limit) -> tuple:
     val = float(value_str)
@@ -872,8 +880,9 @@ def build_header() -> Panel:
     uptime = state.get_uptime_str()
     hostname = _platform.node().split(".")[0]
     date_str = datetime.now().strftime("%m/%d (%a)")
+    adm = "[bold green]ADM[/]" if state.is_admin else "[bold red]USR[/]"
     txt = (
-        f"[bold green]{hostname}[/] [dim]||[/][orange3] {date_str} [/]"
+        f"{adm} [dim]||[/] [bold green]{hostname}[/] [dim]||[/][orange3] {date_str} [/]"
         f"[dim]||[/][orange3] {now} [/][dim]||[/] "
         f"{state.weather} [dim]||[/] "
         f"[bold red]UP: {uptime}[/] [dim]||[/] WHEA [{'green' if state.whea_errors == 0 else 'red1'}]{state.whea_errors:.0f}[/]"
@@ -988,18 +997,23 @@ def build_balthasar() -> Panel:
         else:
             dn_kbps = num
 
-    # 当前速度显示（保持原始字符串）
-    net_cur = net_dn_raw
+    # 当前速度显示（按量级换算单位）
+    if dn_kbps >= 1024 * 1024:
+        net_cur = f"{dn_kbps / 1024 / 1024:.2f} GB/s"
+    elif dn_kbps >= 1024:
+        net_cur = f"{dn_kbps / 1024:.2f} MB/s"
+    else:
+        net_cur = f"{dn_kbps:.2f} KB/s"
 
     # 历史最大（格式化，单位统一）
     max_kbps = state.get_max_net_dn_kbps()
     if max_kbps > 0:
         if max_kbps >= 1024 * 1024:
-            max_str = f"{max_kbps / 1024 / 1024:.1f} GB/s"
+            max_str = f"{max_kbps / 1024 / 1024:.1f} GB"
         elif max_kbps >= 1024:
-            max_str = f"{max_kbps / 1024:.1f} MB/s"
+            max_str = f"{max_kbps / 1024:.1f} MB"
         else:
-            max_str = f"{max_kbps:.0f} KB/s"
+            max_str = f"{max_kbps:.0f} KB"
         net_display = f"[gold1]▼{net_cur}[/]@[dim]{max_str}[/]"
     else:
         net_display = f"[gold1]▼{net_cur}[/]"
@@ -1033,13 +1047,13 @@ def build_balthasar() -> Panel:
     t.add_row("NET-DN", net_display)
     _wd = f"[dim]WD[/][bold {get_temp_color(state.nvme1_temp)}]{state.nvme1_temp:.0f}[/]"
     _sp = f"[dim]SP[/][bold {get_temp_color(state.nvme2_temp)}]{state.nvme2_temp:.0f}[/]"
-    _st = f"[dim]ST[/][bold {get_temp_color(state.sata_temp)}]{state.sata_temp:.0f}[/]"
+    _xh = f"[dim]CS[/][bold {get_temp_color(state.xhci_temp)}]{state.xhci_temp:.0f}[/]"
     _mb = f"[dim]MB[/][bold {get_temp_color(state.mb_temp)}]{state.mb_temp:.0f}[/]"
-    t.add_row("SDTMP",  f"{_mb} {_wd} {_sp} {_st} °C")
+    t.add_row("AUTMP",  f"{_mb} {_xh} {_wd} {_sp} °C")
     _disk_spark = generate_sparkline(state.disk_snapshot, width=22, y_range=(0, 50), low_color="cyan", mid_color="yellow", high_color="red")
     t.add_row("DISK",   _disk_spark)
     t.add_row("TCP",    tcp_str) 
-    t.add_row("PING",   f"{ping_str} [dim]IP[/][cyan]{ip_str}[/]")
+    t.add_row("PING",   f"{ping_str} [dim]IP[/][green]{ip_str}[/]")
     t.add_row("FAN",    f"[dim]CF1[/][indian_red1]{state.aux_fan1}[/] [dim]CF2[/][indian_red1]{state.aux_fan2}[/]")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
@@ -1125,7 +1139,7 @@ def build_casper() -> Panel:
         elif _kbps >= 1024:
             _c = "green"
         else:
-            _c = "dim"
+            _c = "cyan"
         _pcie_throughput += f" [{_c}]{_arrow}{_s}[/]"
     t.add_row("PCIe",   _pcie_throughput.strip())
     t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
@@ -1341,6 +1355,7 @@ class MAGIApp(App):
         Binding("m", "launch_pstop", "pstop", show=True),
         Binding("n", "launch_psnet", "psnet", show=True),
         Binding("t", "launch_yazi", "yazi", show=True),
+        Binding("r", "restart_hwinfo", "restart HWiNFO", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -1378,11 +1393,26 @@ class MAGIApp(App):
             t.start()
 
         # HWiNFO64 周期性重启状态机（0=空闲, 1=已强杀等待, 2=已启动等待验证）
-        # 首次触发锚定开机时间 + 11h40m；脚本晚于该时刻启动则下次检查即触发
-        self._hwinfo_next_restart: float = state.boot_time + HWiNFO_RESTART_INTERVAL
+        # 首次触发锚定 HWiNFO 自身启动时间 + 11h40m（而非系统开机时间）：
+        # 避免每次打开脚本都无差别强杀一次；HWiNFO 已运行满 12h 时打开脚本仍会触发一轮（数据正要过期）
+        self._hwinfo_next_restart: float = time.time() + HWiNFO_RESTART_INTERVAL
+        try:
+            for _p in psutil.process_iter(["name", "create_time"]):
+                if _p.info["name"] and _p.info["name"].lower() == HWiNFO_PROC_NAME.lower():
+                    self._hwinfo_next_restart = _p.info["create_time"] + HWiNFO_RESTART_INTERVAL
+                    break
+        except Exception:
+            pass
         self._hwinfo_phase: int = 0
         self._hwinfo_wait_since: float = 0.0
         self._hwinfo_failed_warned: bool = False
+        self._hwinfo_retries: int = 0
+        self._hwinfo_startup_check_done: bool = False
+        self._hwinfo_startup_check_since: float = time.time()
+
+        # 启动提权自检：HWiNFO 强杀/启动需要管理员权限
+        state.is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        self._hwinfo_log(f"启动自检 is_admin={state.is_admin}")
 
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
@@ -1568,9 +1598,9 @@ class MAGIApp(App):
         nv2_t = scanner.get_val("Drive Temperature", "°C", hw_contains="spcc")
         if nv2_t is not None:
             state.nvme2_temp = parse_n(nv2_t)
-        sata_t = scanner.get_val("Drive Temperature", "°C", hw_contains="sa510")
-        if sata_t is not None:
-            state.sata_temp = parse_n(sata_t)
+        xhci_t = scanner.get_val("Chipset 1 (xHCI)", "°C")
+        if xhci_t is not None:
+            state.xhci_temp = parse_n(xhci_t)
 
         psu = scanner.get_val("GPU PCIe +12V Input Voltage", "V")
         if psu is not None:
@@ -1623,6 +1653,7 @@ class MAGIApp(App):
         state.update_external_ip()  # HTTP (api.ipify.org) 每30分钟更新
         state.update_tcp_counts()
         self._hwinfo_restart_tick()
+        self._hwinfo_startup_recover()
 
     # ── HWiNFO64 周期性重启 ────────────────────────────────────────────────
 
@@ -1634,55 +1665,139 @@ class MAGIApp(App):
         except Exception:
             return False
 
+    def _hwinfo_log(self, msg: str) -> None:
+        """HWiNFO 重启状态机诊断日志（追加写，静默失败不影响主程序）。
+        超限自动裁剪：超过上限时保留后半行数（与 crash_log 同款策略）。"""
+        try:
+            p = Path(__file__).parent / HWiNFO_RESTART_LOG
+            if not p.parent.exists():
+                p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%m-%d %H:%M:%S} {msg}\n")
+            if p.stat().st_size > HWiNFO_RESTART_LOG_MAX_BYTES:
+                lines = p.read_text(encoding="utf-8").splitlines()
+                if len(lines) > 10:
+                    p.write_text(
+                        "\n".join(lines[-(len(lines) // 2):]) + "\n",
+                        encoding="utf-8"
+                    )
+        except Exception:
+            pass
+
+    def _safe_notify(self, msg: str, severity="information", timeout=5) -> None:
+        """notify 包装：提升权限的 WT 下 toast 可能异常，绝不因通知影响状态机。"""
+        try:
+            self.notify(msg, severity=severity, timeout=timeout)
+        except Exception:
+            pass
+
+    def _launch_hwinfo(self, auto: bool = False) -> bool:
+        """启动 HWiNFO64。
+
+        requireAdministrator 目标不能用 subprocess.Popen：即使调用进程已提权，
+        CreateProcess 仍返回 WinError 740（已实测复现）。必须用 ShellExecuteW
+        （Explorer 双击提权 exe 同款路径），返回 >32 即成功。
+        """
+        try:
+            shell_execute_w = ctypes.windll.shell32.ShellExecuteW
+            shell_execute_w.restype = ctypes.c_ssize_t
+            rc = shell_execute_w(None, "open", HWiNFO_EXE_PATH, None, None, 1)
+        except Exception as e:
+            self._hwinfo_log(f"ShellExecuteW 异常: {e!r}")
+            return False
+        if rc > 32:
+            self._hwinfo_log(f"阶段1 ShellExecuteW 启动成功 (rc={rc})" + (" [启动巡检]" if auto else ""))
+            return True
+        err = {2: "文件不存在", 3: "路径不存在", 5: "拒绝访问（未提权）"}.get(rc, "未知错误")
+        self._hwinfo_log(f"阶段1 ShellExecuteW 启动失败 rc={rc} ({err})" + (" [启动巡检]" if auto else ""))
+        if not auto and not self._hwinfo_failed_warned:
+            self._hwinfo_failed_warned = True
+            self._safe_notify("[bold][red]⚠️  HWiNFO64 启动失败（未以管理员运行？）", severity="warning", timeout=8)
+        return False
+
+    def _hwinfo_startup_recover(self) -> None:
+        """启动恢复巡检（单次）：提权实例启动 30s 后若 HWiNFO 未运行则自动拉起。
+        非提权不动作，仅记日志提示（防止传感器长期缺席）。"""
+        if self._hwinfo_startup_check_done:
+            return
+        if time.time() - self._hwinfo_startup_check_since < HWiNFO_STARTUP_RECOVER_DELAY:
+            return
+        self._hwinfo_startup_check_done = True
+        if self._hwinfo_alive():
+            return
+        if not state.is_admin:
+            self._hwinfo_log("启动巡检：HWiNFO64 未运行且未提权，跳过自动拉起")
+            return
+        if self._launch_hwinfo(auto=True):
+            self._safe_notify("[bold][#FFD700]⚠️  HWiNFO64 未运行，已自动拉起", timeout=5)
+        else:
+            self._safe_notify("[bold][red]⚠️  HWiNFO64 自动拉起失败", severity="warning", timeout=8)
+
     def _hwinfo_restart_tick(self) -> None:
-        """三阶段状态机：定时强杀 HWiNFO64 → 等待 5s → 重启 → 验证。
+        """三阶段状态机（带启动失败重试）：定时强杀 HWiNFO64 → 等待 → 启动 → 轮询验证。
         规避 HWiNFO 共享内存约 12 小时停更的问题。需提升权限运行方可强杀。
+        要点：状态迁移先于通知执行，通知失败不影响推进；验证失败会重试而非空等 11h40m。
         """
         now = time.time()
         if self._hwinfo_phase == 0:
-            # 空闲：到达重启时刻则强杀
+            # 空闲：到达重启时刻则强杀（r 键手动触发同样走这里）
             if now < self._hwinfo_next_restart:
                 return
+            rc = -999
             try:
-                subprocess.run(["taskkill", "/F", "/IM", HWiNFO_PROC_NAME],
-                               capture_output=True, timeout=10)
-            except Exception:
-                pass
+                rc = subprocess.run(["taskkill", "/F", "/IM", HWiNFO_PROC_NAME],
+                                    capture_output=True, timeout=10).returncode
+            except Exception as e:
+                self._hwinfo_log(f"阶段0 taskkill 异常: {e!r}")
+            self._hwinfo_retries = 0
+            self._hwinfo_log(f"阶段0 强杀 returncode={rc}")
             if self._hwinfo_alive():
-                # 强杀失败（通常是无管理员权限，进程仍在运行）
+                # 强杀失败：HWiNFO 仍在运行（通常是未提权，taskkill 被拒）
+                self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
                 if not self._hwinfo_failed_warned:
                     self._hwinfo_failed_warned = True
-                    self.notify("[bold][red]⚠️  HWiNFO64 强杀失败（需管理员权限），跳过本轮重启", severity="warning", timeout=8)
-                self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
+                    self._safe_notify("[bold][red]⚠️  HWiNFO64 强杀失败：进程仍在运行（未以管理员运行？）", severity="warning", timeout=8)
                 return
-            self.notify("[bold][#FFD700]⚠️  HWiNFO64 定时重启：已终止，稍后自动启动", timeout=5)
             self._hwinfo_phase = 1
             self._hwinfo_wait_since = now
+            self._safe_notify("[bold][#FFD700]⚠️  HWiNFO64 定时重启：已终止，稍后自动启动", timeout=5)
             return
         if self._hwinfo_phase == 1:
-            # 已强杀：等待 5s 后启动（若期间自行恢复则跳过启动）
+            # 已强杀：等待后启动（若期间自行恢复则跳过启动）
             if now - self._hwinfo_wait_since < HWiNFO_KILL_WAIT_SEC:
                 return
             if not self._hwinfo_alive():
-                try:
-                    subprocess.Popen([HWiNFO_EXE_PATH])
-                except Exception:
-                    if not self._hwinfo_failed_warned:
-                        self._hwinfo_failed_warned = True
-                        self.notify("[bold][red]⚠️  HWiNFO64 启动失败", severity="warning", timeout=8)
+                self._launch_hwinfo()
+            else:
+                self._hwinfo_log("阶段1 检测到进程自行恢复，跳过启动")
             self._hwinfo_phase = 2
             self._hwinfo_wait_since = now
             return
         if self._hwinfo_phase == 2:
-            # 已启动：等待 3s 验证进程存在，然后进入下一周期
-            if now - self._hwinfo_wait_since < HWiNFO_LAUNCH_WAIT_SEC:
+            # 已启动：轮询验证进程存在；失败重试（最多 MAX_RETRIES 次），耗尽后退避
+            if now - self._hwinfo_wait_since < HWiNFO_LAUNCH_POLL_IVL:
                 return
-            if not self._hwinfo_alive() and not self._hwinfo_failed_warned:
+            if self._hwinfo_alive():
+                self._hwinfo_log("阶段2 进程存活，本轮重启成功")
+                self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
+                self._hwinfo_phase = 0
+                self._hwinfo_failed_warned = False
+                return
+            if now - self._hwinfo_wait_since < HWiNFO_LAUNCH_VERIFY_SEC:
+                return
+            self._hwinfo_retries += 1
+            if self._hwinfo_retries < HWiNFO_MAX_RETRIES:
+                self._hwinfo_log(f"阶段2 验证失败，重试 {self._hwinfo_retries}/{HWiNFO_MAX_RETRIES}")
+                self._hwinfo_phase = 1
+                self._hwinfo_wait_since = now
+                return
+            # 重试耗尽：退避后再回空闲，等待下个周期再试（而非空等 11h40m）
+            self._hwinfo_log(f"阶段2 验证失败 {HWiNFO_MAX_RETRIES} 次，退避 {HWiNFO_RETRY_BACKOFF}s 后重试")
+            if not self._hwinfo_failed_warned:
                 self._hwinfo_failed_warned = True
-                self.notify("[bold][red]⚠️  HWiNFO64 重启后未检测到进程", severity="warning", timeout=8)
-            self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
+                self._safe_notify("[bold][red]⚠️  HWiNFO64 重启后未检测到进程", severity="warning", timeout=8)
+            self._hwinfo_next_restart = now + HWiNFO_RETRY_BACKOFF
             self._hwinfo_phase = 0
-            self._hwinfo_failed_warned = False
             return
 
     # ── 日志定时器 ────────────────────────────────────────────────────────────
@@ -1733,7 +1848,7 @@ class MAGIApp(App):
                 f"{s.cpu_eff_freq:.0f},{s.cpu_cstate_level},{s.cpu_fan},"
                 f"{s.cpu_vddcr_v:.3f},"
                 f"{s.used_p:.1f},{s.mem1_temp:.1f},{s.mem2_temp:.1f},"
-                f"{s.nvme1_temp:.1f},{s.nvme2_temp:.1f},{s.sata_temp:.1f},"
+                f"{s.nvme1_temp:.1f},{s.nvme2_temp:.1f},{s.xhci_temp:.1f},"
                 f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
                 f"{s.current_gpu_power:.1f},{_gfreq_last:.0f},"
                 f"{s.gpu_volt:.3f},{s.vram_used_pct:.1f},{s.gpu_status},{s.gpu_pstate},"
@@ -1777,6 +1892,14 @@ class MAGIApp(App):
     def action_launch_psnet(self) -> None:
         with self.suspend():
             subprocess.run(["psnet"])
+
+    def action_restart_hwinfo(self) -> None:
+        """R 键：立即触发一轮 HWiNFO64 强杀重启（手动恢复/调试用）。"""
+        self._hwinfo_retries = 0
+        self._hwinfo_phase = 0
+        self._hwinfo_next_restart = 0.0   # 恒触发，下一个 5s tick 即执行
+        self._hwinfo_log("R 键手动触发重启")
+        self._safe_notify("[bold][#FFD700]R 键触发 HWiNFO64 重启", timeout=5)
 
     # ── 警报 ───────────────────────────────────────────────────────────
         

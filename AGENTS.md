@@ -83,6 +83,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 | `m` | Launch `pstop` (via `self.suspend()`) |
 | `n` | Launch `psnet` |
 | `t` | Launch `yazi f:\` |
+| `r` | 手动触发一轮 HWiNFO64 强杀重启（调试/恢复用）；未提权时仅提示不强杀 |
 
 ## Conventions
 
@@ -107,7 +108,10 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 ## Completed Fixes
 
 - **PROCHOT 降频警报替代高温警报** — 移除 75/80°C 温度 Toast 警报，改为 PROCHOT 信号（`thermal throttling (prochot cpu/ext)`）驱动：双触发 2 级 / 任一 1 级，30s 去重；MELCHIOR 面板原 THRM 行改为 LIMIT 行显示 `CPU TDC/EDC Limit` 百分比
-- **HWiNFO64 周期性重启（规避 12h 共享内存停更）** — `_collect_slow_tasks` 内三阶段状态机：开机 11h40m 首次触发，`taskkill /F` 强杀 → 5s → `Popen` 重启 → 3s 验证；之后每 11h40m 周期执行；scanner 每帧重开映射句柄，重启后自动恢复；强杀失败（无权限）提示一次并顺延
+- **HWiNFO64 周期性重启（规避 12h 共享内存停更）** — `_collect_slow_tasks` 内三阶段状态机：首次触发锚定 **HWiNFO 自身启动时间 + 11h40m**（`psutil process create_time`，而非系统开机时间——避免每次打开脚本都无差别强杀一轮），`taskkill /F` 强杀 → 5s → **`ShellExecuteW("open")` 重启（勿用 `subprocess.Popen`！）** → 轮询验证（1s×10s）；之后每 11h40m 周期执行；scanner 每帧重开映射句柄，重启后自动恢复；强杀失败（进程仍在运行）提示一次并顺延
+- **HWiNFO 启动必须用 `ShellExecuteW`** — requireAdministrator 目标用 `subprocess.Popen`（CreateProcess）启动，**即使调用进程已提权（High Integrity）也返回 WinError 740「请求的操作需要提升」**（2026-08-04 实测复现：提权 WT 中直接 `Popen` 报 740，`ShellExecuteW` rc=42 成功）。`_launch_hwinfo()` 是唯一启动路径（ShellExecuteW 不返回 pid，阶段 2 按进程名验证）
+- **启动提权自检 + 恢复巡检** — `on_mount` 记录 `state.is_admin`（`IsUserAnAdmin`）进 hwinfo_restart.log；header 显示 `[ADM]`(绿)/`[USR]`(红) 角标；启动 30s 后若提权且 HWiNFO 未运行则 `_launch_hwinfo(auto=True)` 自动拉起，非提权仅记日志不动作
+- **hwinfo_restart.log 自动裁剪** — 上限 `HWiNFO_RESTART_LOG_MAX_BYTES = 256KB`，超限时保留后半行数（与 crash_log 同款策略，静默失败不影响主程序）
 - **PCIe 吞吐单位修正** — `nvmlDeviceGetPcieThroughput` 原生返回 KB/s，原代码误当 bytes 再除 1000（显示缩小 1000 倍）；`pcie_link_gts`（GT/s 链路速率）意义不大已删除（含 crash_log 列）
 - **CPU 核心电压改用 HWiNFO 原生 SVI3 传感器** — 移除原 8 核 VID 采集与平均（LHM 限制），切换为 `CPU VDDCR_VDD Voltage (SVI3 TFN)`，MELCHIOR `V-AVG` 行改 `V-DDC` 显示 `cpu_vddcr_v`；crash_log 的 `cpu_vid1~8` 列替换为该单列
 - **LHM JSON API → HWiNFO 共享内存** — 移除 `http://localhost:8085/data.json` 轮询，`MAGIScanner` 改为 ctypes `MapViewOfFile` 读取 `Global\HWiNFO_SENS_SM2`（魔数 `0x53695748`），固定偏移解析 (rev2+ reading 元素勿用 `ctypes.sizeof`)；无需管理员权限；HWiNFO label 全部小写且单位独立于 label 字段；PCIe 行改显示链路速率 `GT/s`；CPU 风扇改用 `CPUFANIN0`；iGPU TREND 改用 `GPU D3D Usage`；iCORE 改用 `GPU Utilization`；网络速率改用 HWiNFO `Current DL Rate`（格式化 `NN KB/s` 兼容下游正则）；crash_log 的 `pcie_rx/pcie_tx` 列替换为 `pcie_link_gts`
