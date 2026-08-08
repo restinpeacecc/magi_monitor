@@ -9,7 +9,7 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 ## ✨ 主要特性
 
 - **三贤者面板**：
-- **MELCHIOR**: CPU 监控，标题栏显示活跃核心数 `N/8 ACTV` + 功率/频率四级热余量指示灯（CRITICAL/WARN/ATTN/STBL）
+- **MELCHIOR**: CPU 监控，标题栏显示 Core C6 驻留率 `NN% C6` + 功率/频率四级热余量指示灯（CRITICAL/WARN/ATTN/STBL）
 - **BALTHASAR**: 系统状态，标题栏显示最高 CPU 占用进程 + 功耗状态灯
 - **CASPER**: GPU 监控，标题栏显示 pynvml Clocks Event Reasons + 性能状态 P-State
 
@@ -110,6 +110,7 @@ CPU 集成显卡启用后，HWiNFO 会同时报告 iGPU + dGPU 的同名传感�
 | `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU 状态 + 诊断（解码器/编码器/显存利用率） |
 | `_log_tick` | **1s** | 主线程 | CSV 日志追加 (文件 I/O <1ms) |
 | `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top 进程、ping、天气、TCP、swap |
+| `hwinfo-restart` 守护线程 | **1s** | `threading.Thread` (daemon) | HWiNFO64 定时重启状态机 + 启动巡检（与 Textual worker 解耦，防慢任务饿死） |
 
 ### 核心类
 
@@ -120,7 +121,7 @@ CPU 集成显卡启用后，HWiNFO 会同时报告 iGPU + dGPU 的同名传感�
 ## 📊 面板说明
 
 ### MELCHIOR (CPU)
-- **标题**: `MELCHIOR | N/8 ACTV`，活跃核心数颜色编码（0~1 青色、2~4 绿色、5~6 黄色、7~8 红色）
+- **标题**: `MELCHIOR | NN% C6`，Core C6 驻留率反向着色（≥90% 红、≥60% 黄、≥30% 绿、<30% 青）
 - **副标题**: 功率+频率四级指示灯（CRITICAL 红闪 2.5Hz / WARN 金闪 1Hz / ATTN 绿闪 0.5Hz / STBL 青 reverse）
 - LOAD: CPU 使用率进度条
 - FREQ: 频率 + 趋势箭头 + 最小/最大值

@@ -41,15 +41,17 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 | `_tick` | **0.2s** | `@work(thread, exclusive)` | HWiNFO sensor polling, psutil, freq history, alerts |
 | `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU status (Clocks Event Reasons) + diagnostics (decoder/encoder/mem util) + Ping (ICMP echo) + PCIe RX/TX throughput |
 | `_log_tick` | **1s** | Main thread | CSV log append (file I/O < 1ms) |
-| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, swap, weather, external IP, TCP, HWiNFO64 定时重启状态机 |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, swap, weather, external IP, TCP |
+| `hwinfo-restart` daemon thread | **1s** | `threading.Thread` (daemon) | HWiNFO64 定时重启状态机 + 启动巡检（与 Textual worker 完全解耦） |
 
+- **HWiNFO 重启状态机跑在专用守护线程**（`_hwinfo_restart_loop`，evtlog 同款模式）：原实现位于 `_collect_slow_tasks` 末尾，而 `@work(thread, exclusive)` 在前次调用未完成时跳过新调用——`psutil.net_connections()`/天气 HTTP 等慢任务实测可阻塞 20~100s（hwinfo_restart.log 可见强杀成功后无阶段1日志，按 r 键才恢复），导致强杀后永远轮不到启动。专用线程 1s 轮询状态机，r 键仍只写标量标志，1s 内生效。
 - **State (`MagiState`) is shared between threads without locks** on scalar fields. Only the freq history lists are protected by `_list_lock`. When modifying state fields, be aware of potential data races.
 
 ## Panel Titles
 
 | Panel | Title Format | Example | Source |
 |-------|-------------|---------|--------|
-| MELCHIOR (CPU) | `MELCHIOR \| N/8 ACTV` | `MELCHIOR \| 6/8 ACTV` | Active core count (load>10% OR freq ratio>0.15), color-coded |
+| MELCHIOR (CPU) | `MELCHIOR \| NN% C6` | `MELCHIOR \| 87% C6` | HWiNFO `Core C6 Residency` (%), inverted color: high→red / mid→yellow / low→green / very-low→cyan |
 | BALTHASAR (System) | `BALTHASAR \| {name} {cpu}%` | `BALTHASAR \| chrome 23%` | Top CPU-consuming process (`.exe` stripped, 10 char trunc) |
 | CASPER (GPU) | `CASPER \| {status}` | `CASPER \| STBY` | pynvml Clocks Event Reasons → IDLE/STBY/BOOST/PWR/HOT; P-state from NVML `Performance State` |
 
@@ -95,7 +97,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 - **PROCHOT 过热降频警报（Toast）**：核心判定以 HWiNFO `thermal throttling (prochot cpu)` 为主（CPU 内部 DTS 触及 TjMax 89°C），`prochot ext` 为辅（主板 VRM/外围拉低）。`update_alert()` 判定：二者同时触发 → 2 级（CRITICAL OVERHEAT error 通知），任一触发 → 1 级（CPU THROTTLE / VRM THROTTLE warning 通知），30s 去重。边框闪烁（fuse_crit）仍由 CPU 功耗/频率驱动，与 PROCHOT 警报独立。
 - **CPU 核心电压直读**：MELCHIOR `V-DDC` 行显示 HWiNFO 原生 SVI3 传感器 `CPU VDDCR_VDD Voltage (SVI3 TFN)`（`state.cpu_vddcr_v`），不再走 8 核 VID 平均（LHM 限制下的权宜之计，平均值无精确度且掩盖真实单核高 VID）。
-- **MELCHIOR title `MELCHIOR | N/8 ACTV`**: Shows active core count `N/8` (7800X3D = 8 physical cores). "Active" = per-core load > 10% OR effective/nominal frequency ratio > 0.15, read from HWiNFO `Core {i} T0/T1 Usage`（SMT: 物理核 i 两线程取 max）和 `Core {i} Clock` / `Core {i} T0/T1 Effective Clock`. Color tiers: ≤1 cyan, 2~4 green, 5~6 yellow, 7~8 red1.
+- **MELCHIOR title `MELCHIOR | NN% C6`**: Shows HWiNFO `Core C6 Residency` (%) — core idle residency in C6. Color tiers inverted vs. active-core count: ≥90% red1, ≥60% yellow, ≥30% green, <30% cyan. Note: HWiNFO 共享内存中**无单条聚合读数**，实为 8 条每核读数（label `core N c6 residency`），用 `get_core_residency(6)` 取平均；`get_val("Core C6 Residency")` 末尾锚定匹配不到会返回 None。
 - **MELCHIOR TREND row**: iGPU `GPU D3D Usage` + `GPU Video Decode 0 Usage` combined load (%) braille trend. History window = 100 points (~20s at 0.2s interval), clamp 100.
 - **MELCHIOR subtitle** uses `fuse_indicator` driven by CPU power + frequency, independent from iGPU state.
 - **MELCHIOR PKG-W shows C-State**: `52.3 W | C0` format, matching CASPER's `TGP | P0` format. Uses original `cpu_cstate_level` from effective/nominal freq ratio.
@@ -107,6 +109,8 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 ## Completed Fixes
 
+- **HWiNFO 定时强杀后不自动重启（空转）根治** — 日志铁证：`阶段0 强杀 returncode=0` 后无任何阶段1日志，按 r 键才恢复。三处加固：① `_safe_notify` 不再从守护线程直调 `self.notify()`（Textual 消息泵非线程安全，可能阻塞/崩溃），改为压入队列由主线程 `_tick` 每 0.2s 排空（与 evtlog 告警同款模式）；② 阶段0 强杀后轮询确认进程真正消失（`HWiNFO_KILL_SETTLE_POLLS`×`HWiNFO_KILL_SETTLE_STEP` 合计 ~3s），修复 taskkill 返回 0 后进程表残留数十毫秒导致 `_hwinfo_alive()` 误判「强杀失败」→ 空等 11h40m 的竞态；③ 启动巡检由单次改为连续看门狗（30s 节流）：状态机空闲且 HWiNFO 缺席 → 自动拉起并重新锚定下次重启时刻；阶段 1/2 停留超过 `HWiNFO_WEDGE_RESET_SEC`(120s) → 判定卡死强制重置走 R 键同款路径。此后「杀得掉、拉不起」任一环节静默失败都能在 ~30s 内自愈
+- **HWiNFO 重启状态机迁移到专用守护线程（修复定时重启「杀得掉、拉不起」）** — 原状态机位于 `_collect_slow_tasks` 末尾，`@work(thread, exclusive)` 在前次调用未完成时跳过新调用；`psutil.net_connections()`/天气 HTTP 等慢任务实测可阻塞 20~100s，强杀成功后启动步骤被无限饿死（hwinfo_restart.log 可见强杀后长时间无阶段1日志，按 r 键才恢复）。现由 `_hwinfo_restart_loop` 专用守护线程（evtlog 同款模式）1s 轮询驱动，与 Textual worker 完全解耦；顺带修复天气/外网 IP 失败后每 5s 无节流重试的问题（`finally` 统一节流 30min）
 - **PROCHOT 降频警报替代高温警报** — 移除 75/80°C 温度 Toast 警报，改为 PROCHOT 信号（`thermal throttling (prochot cpu/ext)`）驱动：双触发 2 级 / 任一 1 级，30s 去重；MELCHIOR 面板原 THRM 行改为 LIMIT 行显示 `CPU TDC/EDC Limit` 百分比
 - **HWiNFO64 周期性重启（规避 12h 共享内存停更）** — `_collect_slow_tasks` 内三阶段状态机：首次触发锚定 **HWiNFO 自身启动时间 + 11h40m**（`psutil process create_time`，而非系统开机时间——避免每次打开脚本都无差别强杀一轮），`taskkill /F` 强杀 → 5s → **`ShellExecuteW("open")` 重启（勿用 `subprocess.Popen`！）** → 轮询验证（1s×10s）；之后每 11h40m 周期执行；scanner 每帧重开映射句柄，重启后自动恢复；强杀失败（进程仍在运行）提示一次并顺延
 - **HWiNFO 启动必须用 `ShellExecuteW`** — requireAdministrator 目标用 `subprocess.Popen`（CreateProcess）启动，**即使调用进程已提权（High Integrity）也返回 WinError 740「请求的操作需要提升」**（2026-08-04 实测复现：提权 WT 中直接 `Popen` 报 740，`ShellExecuteW` rc=42 成功）。`_launch_hwinfo()` 是唯一启动路径（ShellExecuteW 不返回 pid，阶段 2 按进程名验证）

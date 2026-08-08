@@ -75,6 +75,9 @@ CPU_FREQ_MAX = 5000.0              # MHz（Braille 曲线 Y 轴上限）
 # HWiNFO64 周期性重启（规避 12 小时共享内存停更问题）
 HWiNFO_RESTART_INTERVAL = 11 * 3600 + 40 * 60   # 42000s = 11h40m
 HWiNFO_KILL_WAIT_SEC    = 5                     # 强杀后等待秒数再启动
+HWiNFO_KILL_SETTLE_STEP = 0.5                   # 强杀后轮询进程消失的步长
+HWiNFO_KILL_SETTLE_POLLS= 6                     # 最多轮询次数（合计 ~3s），避免误判残留进程
+HWiNFO_WEDGE_RESET_SEC  = 120                   # 状态机同阶段停留超过该秒数视为卡死，强制重置
 HWiNFO_EXE_PATH         = r"C:\Program Files\HWiNFO64\HWiNFO64.EXE"
 HWiNFO_PROC_NAME        = "HWiNFO64.exe"
 HWiNFO_LAUNCH_POLL_IVL  = 1.0                   # 启动后每 1s 轮询验证进程
@@ -218,10 +221,9 @@ class MagiState:
         except Exception:
             pass
 
-        # 每核负载 / 每核 C-State / 活跃核心数（7800X3D = 8 物理核，16 逻辑线程）
+        # 每核负载 / Core C6 驻留率（7800X3D = 8 物理核，16 逻辑线程）
         self.core_loads: list[float] = [0.0] * 8
-        self.core_cstates: list[str] = ["C?"] * 8
-        self.active_cores: int = 0
+        self.core_c6_residency: float = 0.0
 
         # 新增：面板临界状态和闪烁状态
         self.fuse_crit: bool = False
@@ -389,9 +391,11 @@ class MagiState:
             try:
                 res = requests.get("https://wttr.in/?format=3", timeout=1)
                 self.weather = res.text.strip()
-                self.last_weather_update = time.time()
             except Exception:
                 self.weather = "OFFLINE"
+            finally:
+                # 失败也节流：原逻辑失败后每 5s 重试，DNS/连接挂起会拖慢 slow_tasks
+                self.last_weather_update = time.time()
 
     def update_external_ip(self):
         """外网公网 IP（HTTP 探针，每 30min 刷新一次，与天气共用低频节奏）"""
@@ -399,9 +403,11 @@ class MagiState:
             try:
                 res = requests.get("https://api.ipify.org", timeout=1)
                 self.ip_external = res.text.strip()
-                self.last_ip_update = time.time()
             except Exception:
                 self.ip_external = ""
+            finally:
+                # 失败也节流，防止每 5s 重试阻塞 slow_tasks worker
+                self.last_ip_update = time.time()
 
     # ── GPU 运行状态/诊断（pynvml 直调，无子进程） ──
 
@@ -705,6 +711,19 @@ class MAGIScanner:
                 return v
         return 0.0
 
+    def get_core_residency(self, level: int) -> float:
+        """返回 8 个物理核 'Core N C{level} Residency' 读数的平均（%）。
+        HWiNFO 无单条聚合读数，label 形如 'core N c{level} residency'，取平均。
+        """
+        total = 0.0
+        cnt = 0
+        suf = f"c{level} residency"
+        for sensor, label, _u, _s, v in self._cache:
+            if "cpu" in sensor and label.startswith("core ") and label.endswith(suf):
+                total += v
+                cnt += 1
+        return total / cnt if cnt else 0.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  模块级单例
@@ -921,7 +940,7 @@ def build_melchior() -> Panel:
     # ── 边框闪烁仍由 CPU 功耗/频率决定 ──
     _pwr = state.current_cpu_power
     _eff = state.cpu_freq_nom
-    if _pwr >= 50 and _eff >= 4700:
+    if _pwr >= 60:
         state.fuse_crit = True
         _sub_color, _sub_freq, _sub_text = "bold red1", 2.5, " CRITICAL "
     elif _pwr >= 40 and _eff >= 4400:
@@ -956,13 +975,15 @@ def build_melchior() -> Panel:
         _core_str = "[green]IDLE[/]"
     t.add_row("iGPU", _core_str + f"[dim] | [/][red]{state.igpu_mem:.0f} MB[/]")
     t.add_row("LIMIT",  f"[dim]TDC[/]{_tdc_s} [dim]EDC[/]{_edc_s}")
-    t.add_row("FAN ",   f"[indian_red1]{state.cpu_fan or 'OFFLINE'}[/]")
-    _active_color = "cyan" if state.active_cores <= 1 else \
-                    "green" if state.active_cores <= 4 else \
-                    "yellow" if state.active_cores <= 6 else "red1"
+    t.add_row("FAN ",   f"[dim]CPU[/][indian_red1]{state.cpu_fan}[/] RPM")
+    # ── 标题：Core C6 驻留率（高→红 / 中→黄 / 低→绿 / 极低→青，与活跃核心数反向着色）──
+    _c6_res = state.core_c6_residency
+    _c6_color = "cyan" if _c6_res >= 90 else \
+               "green" if _c6_res >= 60 else \
+               "yellow" if _c6_res >= 30 else "red"
     mel_title = (
         f"[bold orange3]MELCHIOR[/] | "
-        f"[bold {_active_color}]{state.active_cores}/8 ACTV[/]"
+        f"[bold {_c6_color}]{_c6_res:.0f}% C6[/]"
     )
     
     # ── 边框逻辑：用刚判定的 fuse_crit ──
@@ -1054,7 +1075,7 @@ def build_balthasar() -> Panel:
     t.add_row("DISK",   _disk_spark)
     t.add_row("TCP",    tcp_str) 
     t.add_row("PING",   f"{ping_str} [dim]IP[/][green]{ip_str}[/]")
-    t.add_row("FAN",    f"[dim]CF1[/][indian_red1]{state.aux_fan1}[/] [dim]CF2[/][indian_red1]{state.aux_fan2}[/]")
+    t.add_row("FAN",    f"[dim]CF1[/][indian_red1]{state.aux_fan1}[/] [dim]CF2[/][indian_red1]{state.aux_fan2}[/] RPM")
     _top_color = "cyan" if state.top_proc_cpu < 10 else "green" if state.top_proc_cpu < 50 else "yellow" if state.top_proc_cpu < 80 else "red"
     _top_display = f"{state.top_proc_name} {state.top_proc_cpu:.0f}%" if state.top_proc_name else "INIT"
     bal_title = f"[bold orange3]BALTHASAR[/] | [bold {_top_color}]{_top_display}[/]"
@@ -1142,7 +1163,7 @@ def build_casper() -> Panel:
             _c = "cyan"
         _pcie_throughput += f" [{_c}]{_arrow}{_s}[/]"
     t.add_row("PCIe",   _pcie_throughput.strip())
-    t.add_row("FAN ",   f"[indian_red1]{state.gpu_fan or 'N/A'}[/]")
+    t.add_row("FAN ",   f"[dim]GPU[/][indian_red1]{state.gpu_fan}[/] RPM")
     _gpu_color = {"STBY": "cyan", "BOOST": "gold1", "PWR": "yellow", "THR": "red1", "NORM": "green"}.get(state.gpu_status, "dim")
     cas_title = f"[bold orange3]CASPER[/] | [bold {_gpu_color}]{state.gpu_status}[/]"
     
@@ -1407,12 +1428,28 @@ class MAGIApp(App):
         self._hwinfo_wait_since: float = 0.0
         self._hwinfo_failed_warned: bool = False
         self._hwinfo_retries: int = 0
-        self._hwinfo_startup_check_done: bool = False
-        self._hwinfo_startup_check_since: float = time.time()
+        # 连续缺席巡检（替代原先的单次启动巡检）：状态机空闲且 HWiNFO 缺席时
+        # 周期性自动拉起，任一环节静默失败也能在 ~30s 内恢复
+        self._hwinfo_last_recover_check: float = time.time()
+        self._hwinfo_recover_log_since: float = 0.0
+        self._hwinfo_last_phase: int = 0
+        self._hwinfo_phase_changed_since: float = time.time()
+        # 通知队列：守护线程不直接触碰 Textual 消息泵（历史上非主线程 notify 引发原生崩溃）
+        self._notify_queue: list[tuple] = []
+        self._notify_lock = threading.Lock()
 
         # 启动提权自检：HWiNFO 强杀/启动需要管理员权限
         state.is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
         self._hwinfo_log(f"启动自检 is_admin={state.is_admin}")
+
+        # HWiNFO 重启状态机专用守护线程（evtlog 同款模式）：
+        # 与 Textual worker 完全解耦，避免被 _collect_slow_tasks 的慢任务
+        # （psutil.net_connections / 天气 HTTP 等，实测可阻塞 20~100s）饿死——
+        # exclusive=True 的 worker 在前次调用未完成时会被跳过，导致强杀后
+        # 永远轮不到启动（日志实测：强杀成功 → 长时间无阶段1日志 → 需按 r 键）。
+        self._hwinfo_shutdown = threading.Event()
+        threading.Thread(target=self._hwinfo_restart_loop, daemon=True,
+                         name="hwinfo-restart").start()
 
     # ── 更新循环 ──────────────────────────────────────────────────────────────
 
@@ -1423,6 +1460,7 @@ class MAGIApp(App):
         # 在主线程中处理 alert 和刷新（替代 worker 中的 call_from_thread）
         self._check_alert()
         self._flush_eventlog_alerts()
+        self._flush_notify_queue()
         self._refresh_all()
 
         # 处理面板边框闪烁逻辑 (2.5 Hz)
@@ -1464,24 +1502,16 @@ class MAGIApp(App):
             f_eff = parse_n(eff_str) if eff_str else 0.0
             state.cpu_cstate_level = ratio_to_cstate(f_eff / f_nom) if f_nom > 0 else "C?"
 
-        # 每核负载 / C-State / 活跃核心数（复合判定:负载>10% OR 频比>0.15）
-        # 7800X3D: 8 物理核 × 2 线程(SMT);取同一物理核两线程的 max
+        # 每核负载（7800X3D: 8 物理核 × 2 线程(SMT);取同一物理核两线程的 max）
         loads: list[float] = []
-        cstates: list[str] = []
-        combined_active = 0
         for i in range(8):
             t1 = scanner.get_core_load(i + 1)
             t2 = scanner.get_core_load(i + 1 + 8)
-            ml = max(t1, t2)
-            loads.append(ml)
-            nom, eff = scanner.get_core_freq(i + 1)
-            cs = ratio_to_cstate(eff / nom) if nom > 0 else "C?"
-            cstates.append(cs)
-            if ml > 10.0 or (nom > 0 and eff / nom > 0.15):
-                combined_active += 1
+            loads.append(max(t1, t2))
         state.core_loads = loads
-        state.core_cstates = cstates
-        state.active_cores = combined_active
+
+        # Core C6 驻留率：HWiNFO 仅提供每核读数（label 'core N c6 residency'），取 8 核平均
+        state.core_c6_residency = scanner.get_core_residency(6)
 
         # CPU 核心电压：HWiNFO 原生 SVI3 传感器（替代原 8 核 VID 平均）
         _vddcr = scanner.get_val("CPU VDDCR_VDD Voltage (SVI3 TFN)", "V")
@@ -1652,10 +1682,19 @@ class MAGIApp(App):
         state.update_weather()  # HTTP (wttr.in) 每30分钟更新
         state.update_external_ip()  # HTTP (api.ipify.org) 每30分钟更新
         state.update_tcp_counts()
-        self._hwinfo_restart_tick()
-        self._hwinfo_startup_recover()
 
     # ── HWiNFO64 周期性重启 ────────────────────────────────────────────────
+
+    def _hwinfo_restart_loop(self) -> None:
+        """专用守护线程：1s 周期驱动 HWiNFO 重启状态机 + 启动巡检。
+        与 Textual worker 完全解耦，任何慢任务（net_connections/天气 HTTP 等）
+        都无法饿死强杀→启动流程。进程退出时随 daemon 线程一并终止。"""
+        while not self._hwinfo_shutdown.wait(1.0):
+            try:
+                self._hwinfo_restart_tick()
+                self._hwinfo_startup_recover()
+            except Exception as e:
+                self._hwinfo_log(f"重启状态机异常: {e!r}")
 
     def _hwinfo_alive(self) -> bool:
         """HWiNFO64 进程是否存在（避免 taskkill 返回码的权限歧义）"""
@@ -1685,11 +1724,34 @@ class MAGIApp(App):
             pass
 
     def _safe_notify(self, msg: str, severity="information", timeout=5) -> None:
-        """notify 包装：提升权限的 WT 下 toast 可能异常，绝不因通知影响状态机。"""
+        """notify 包装（任何线程可调）：主线程直接弹 toast，后台线程压入队列
+        由主线程 _tick 排空——绝不从守护线程触碰 Textual 消息泵（提权 WT 下
+        有原生崩溃史，且 notify 可能阻塞调用线程导致状态机空转）。
+        通知失败静默忽略，不影响状态机推进。"""
+        if threading.current_thread() is threading.main_thread():
+            try:
+                self.notify(msg, severity=severity, timeout=timeout)
+            except Exception:
+                pass
+            return
         try:
-            self.notify(msg, severity=severity, timeout=timeout)
+            with self._notify_lock:
+                self._notify_queue.append((msg, severity, timeout))
         except Exception:
             pass
+
+    def _flush_notify_queue(self) -> None:
+        """主线程每 0.2s 排空通知队列（与 _flush_eventlog_alerts 同款模式）。"""
+        try:
+            with self._notify_lock:
+                items, self._notify_queue = self._notify_queue, []
+        except Exception:
+            return
+        for msg, severity, timeout in items:
+            try:
+                self.notify(msg, severity=severity, timeout=timeout)
+            except Exception:
+                pass
 
     def _launch_hwinfo(self, auto: bool = False) -> bool:
         """启动 HWiNFO64。
@@ -1716,19 +1778,39 @@ class MAGIApp(App):
         return False
 
     def _hwinfo_startup_recover(self) -> None:
-        """启动恢复巡检（单次）：提权实例启动 30s 后若 HWiNFO 未运行则自动拉起。
-        非提权不动作，仅记日志提示（防止传感器长期缺席）。"""
-        if self._hwinfo_startup_check_done:
+        """HWiNFO 缺席自动恢复（连续巡检，替代原先的单次巡检）：
+        - 状态机空闲（phase 0）且 HWiNFO 进程缺席 → 提权时自动拉起并重新锚定下次重启时刻；
+        - 状态机停留在阶段 1/2 超过 HWiNFO_WEDGE_RESET_SEC → 判定卡死，强制回到
+          空闲并立即触发一轮重启（走 R 键同款路径），任何静默失败都能自愈；
+        - 非提权仅限频记日志，不动作。"""
+        now = time.time()
+        # 卡死看门狗：阶段 1/2 停留过久说明状态机失效，重置后由下一个 tick 重新执行
+        if self._hwinfo_phase != self._hwinfo_last_phase:
+            self._hwinfo_last_phase = self._hwinfo_phase
+            self._hwinfo_phase_changed_since = now
+        if (self._hwinfo_phase != 0
+                and now - self._hwinfo_phase_changed_since > HWiNFO_WEDGE_RESET_SEC):
+            self._hwinfo_log(f"巡检：状态机疑似卡死（阶段{self._hwinfo_phase}停留"
+                             f"{int(now - self._hwinfo_phase_changed_since)}s），强制重置")
+            self._hwinfo_phase = 0
+            self._hwinfo_next_restart = 0.0   # 下一个 tick 立即执行（同 R 键路径）
             return
-        if time.time() - self._hwinfo_startup_check_since < HWiNFO_STARTUP_RECOVER_DELAY:
+        if self._hwinfo_phase != 0:
             return
-        self._hwinfo_startup_check_done = True
+        if now - self._hwinfo_last_recover_check < HWiNFO_STARTUP_RECOVER_DELAY:
+            return
+        self._hwinfo_last_recover_check = now
         if self._hwinfo_alive():
             return
         if not state.is_admin:
-            self._hwinfo_log("启动巡检：HWiNFO64 未运行且未提权，跳过自动拉起")
+            # 限频记录，避免每 30s 刷一条日志
+            if now - self._hwinfo_recover_log_since >= 600:
+                self._hwinfo_recover_log_since = now
+                self._hwinfo_log("巡检：HWiNFO64 未运行且未提权，跳过自动拉起")
             return
         if self._launch_hwinfo(auto=True):
+            # 重新锚定重启时刻：新进程从此刻起算 11h40m 后才轮到下次强杀
+            self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
             self._safe_notify("[bold][#FFD700]⚠️  HWiNFO64 未运行，已自动拉起", timeout=5)
         else:
             self._safe_notify("[bold][red]⚠️  HWiNFO64 自动拉起失败", severity="warning", timeout=8)
@@ -1751,7 +1833,16 @@ class MAGIApp(App):
                 self._hwinfo_log(f"阶段0 taskkill 异常: {e!r}")
             self._hwinfo_retries = 0
             self._hwinfo_log(f"阶段0 强杀 returncode={rc}")
-            if self._hwinfo_alive():
+            # 轮询确认进程真正消失：taskkill 返回 0 后进程在进程表中仍可能残留
+            # 数十毫秒，立即检查会误判「强杀失败」→ 放弃本轮重启（实测导致定时
+            # 重启空转，需按 r 键才能恢复）
+            gone = False
+            for _ in range(HWiNFO_KILL_SETTLE_POLLS):
+                time.sleep(HWiNFO_KILL_SETTLE_STEP)
+                if not self._hwinfo_alive():
+                    gone = True
+                    break
+            if not gone:
                 # 强杀失败：HWiNFO 仍在运行（通常是未提权，taskkill 被拒）
                 self._hwinfo_next_restart = now + HWiNFO_RESTART_INTERVAL
                 if not self._hwinfo_failed_warned:
