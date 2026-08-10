@@ -77,6 +77,9 @@ HWiNFO_RESTART_INTERVAL = 11 * 3600 + 40 * 60   # 42000s = 11h40m
 HWiNFO_KILL_WAIT_SEC    = 5                     # 强杀后等待秒数再启动
 HWiNFO_KILL_SETTLE_STEP = 0.5                   # 强杀后轮询进程消失的步长
 HWiNFO_KILL_SETTLE_POLLS= 6                     # 最多轮询次数（合计 ~3s），避免误判残留进程
+HWiNFO_GRACE_WAIT_SEC   = 3                     # 优雅关闭（WM_CLOSE）等待窗口秒数，让 HWiNFO 自行清理资源
+HWiNFO_ETW_SESSION      = "HWiNFO64"            # HWiNFO PresentMon 的 ETW 追踪会话名（强杀遗留孤儿会话→重启撞名 0xC0000035）
+PLA_E_DCS_NOT_FOUND     = 0x80300002            # logman：数据收集器集不存在（与 1168 同义，会话不存在属正常）
 HWiNFO_WEDGE_RESET_SEC  = 120                   # 状态机同阶段停留超过该秒数视为卡死，强制重置
 HWiNFO_EXE_PATH         = r"C:\Program Files\HWiNFO64\HWiNFO64.EXE"
 HWiNFO_PROC_NAME        = "HWiNFO64.exe"
@@ -1760,6 +1763,7 @@ class MAGIApp(App):
         CreateProcess 仍返回 WinError 740（已实测复现）。必须用 ShellExecuteW
         （Explorer 双击提权 exe 同款路径），返回 >32 即成功。
         """
+        self._stop_hwinfo_etw_session()
         try:
             shell_execute_w = ctypes.windll.shell32.ShellExecuteW
             shell_execute_w.restype = ctypes.c_ssize_t
@@ -1776,6 +1780,29 @@ class MAGIApp(App):
             self._hwinfo_failed_warned = True
             self._safe_notify("[bold][red]⚠️  HWiNFO64 启动失败（未以管理员运行？）", severity="warning", timeout=8)
         return False
+
+    def _stop_hwinfo_etw_session(self) -> None:
+        """清理 HWiNFO 遗留的 ETW 追踪会话（PresentMon 数据收集器集）。
+
+        该会话由 Performance Logs 服务托管（Schedules: On），强杀进程后仍存活；
+        下次启动时 HWiNFO 调用 StartTrace("HWiNFO64") 撞名返回 0xC0000035
+        （事件 ID 2，STATUS_OBJECT_NAME_COLLISION），初始化失败退出——
+        这正是 HWiNFO 定时重启"杀得掉、起不来"的根因。启动前用 logman 停掉
+        孤儿会话；会话不存在（returncode 1168）属正常情况，直接忽略。
+        """
+        try:
+            r = subprocess.run(["logman", "stop", HWiNFO_ETW_SESSION, "-ets"],
+                               capture_output=True, timeout=10)
+        except Exception as e:
+            self._hwinfo_log(f"ETW 会话清理异常: {e!r}")
+            return
+        if r.returncode == 0:
+            self._hwinfo_log("ETW 孤儿会话已清理")
+            return
+        if r.returncode in (1168, PLA_E_DCS_NOT_FOUND):   # 会话不存在，无需清理
+            return
+        err = (r.stderr or r.stdout or b"").decode("gbk", "ignore").strip()
+        self._hwinfo_log(f"ETW 会话清理失败 rc={r.returncode} {err[:120]}")
 
     def _hwinfo_startup_recover(self) -> None:
         """HWiNFO 缺席自动恢复（连续巡检，替代原先的单次巡检）：
@@ -1825,6 +1852,16 @@ class MAGIApp(App):
             # 空闲：到达重启时刻则强杀（r 键手动触发同样走这里）
             if now < self._hwinfo_next_restart:
                 return
+            # 先优雅关闭（WM_CLOSE）：给 HWiNFO 自行清理 ETW 追踪会话/驱动的机会
+            # （强杀会遗留 PresentMon 会话，导致下次启动 StartTrace 撞名 0xC0000035）
+            rc = -999
+            try:
+                rc = subprocess.run(["taskkill", "/IM", HWiNFO_PROC_NAME],
+                                    capture_output=True, timeout=10).returncode
+            except Exception as e:
+                self._hwinfo_log(f"阶段0 优雅关闭异常: {e!r}")
+            if rc == 0 and self._hwinfo_alive():
+                time.sleep(HWiNFO_GRACE_WAIT_SEC)
             rc = -999
             try:
                 rc = subprocess.run(["taskkill", "/F", "/IM", HWiNFO_PROC_NAME],
