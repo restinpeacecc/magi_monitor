@@ -148,7 +148,7 @@ CPU 集成显卡启用后，HWiNFO 会同时报告 iGPU + dGPU 的同名传感�
 - PCIe: PCIe 链路速率（GT/s，≥16 绿色 / ≥8 黄色）
 
 ### CASPER (GPU)
-- **标题**: `CASPER | {status}`，状态映射：STBY 青、NORM 绿、BOOST 金、PWR 黄、THR 红
+- **标题**: `CASPER | {status}`，状态映射：STBY 青、NORM 绿、BOOST 金、PWR 黄、THR 红；BOOST = 负载≥30% 且无热/功耗降频位（新驱动的 BoardLimit/Reliability 等位不阻塞）
 - **副标题**: 负载状态灯（IDLE/TRG/LCK/RTX-ON）
 - LOAD: GPU 使用率进度条
 - FREQ: 核心频率 + 趋势箭头

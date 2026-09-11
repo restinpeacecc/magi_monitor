@@ -51,9 +51,17 @@ from pynvml import (
     nvmlClocksEventReasonHwThermalSlowdown,
     nvmlClocksEventReasonSwPowerCap,
     nvmlClocksEventReasonHwPowerBrakeSlowdown,
+    nvmlClocksEventReasonHwSlowdown,
     nvmlDeviceGetPcieThroughput,
     NVML_PCIE_UTIL_RX_BYTES,
     NVML_PCIE_UTIL_TX_BYTES,
+)
+
+# 仅热/功耗类降频位阻止 BOOST；新驱动（v580+）新增的 BoardLimit(0x200)/Reliability(0x400) 常驻但不参与判定
+_GPU_THROTTLE_MASK = (
+    nvmlClocksEventReasonSwThermalSlowdown | nvmlClocksEventReasonHwThermalSlowdown
+    | nvmlClocksEventReasonSwPowerCap | nvmlClocksEventReasonHwPowerBrakeSlowdown
+    | nvmlClocksEventReasonHwSlowdown
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -431,7 +439,7 @@ class MagiState:
                 self.gpu_status = "PWR"
             elif reasons & nvmlClocksEventReasonGpuIdle:
                 self.gpu_status = "STBY"
-            elif self.gpu_load >= 30 and reasons == 0:
+            elif self.gpu_load >= 30 and not (reasons & _GPU_THROTTLE_MASK):
                 self.gpu_status = "BOOST"
             elif self.gpu_load >= 10:
                 self.gpu_status = "NORM"
