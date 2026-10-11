@@ -23,8 +23,10 @@ MAGI 系统监控器 — Textual 版（异步事件循环、线程工作器、CS
 ## 🚀 安装依赖
 
 ```bash
-pip install textual rich psutil requests nvidia-ml-py
+pip install textual rich psutil requests nvidia-ml-py pywin32
 ```
+
+> `pywin32` 仅在需要 Windows 事件日志监控（提权模式）时使用，详见下方「Windows 事件日志监控」章节。
 
 ## ▶️ 运行
 
@@ -51,6 +53,7 @@ python magi_monitor_MIX.py
 | `m` | 暂停并启动 pstop |
 | `n` | 暂停并启动 psnet |
 | `t` | 暂停并启动 yazi f:\ |
+| `r` | 重启 HWiNFO64 |
 
 ## 🔧 配置说明
 
