@@ -38,10 +38,10 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 
 | Timer | Period | Worker | Tasks |
 |-------|--------|--------|-------|
-| `_tick` | **0.2s** | `@work(thread, exclusive)` | HWiNFO sensor polling, psutil, freq history, alerts |
+| `_tick` | **0.2s** | `@work(thread, exclusive)` | HWiNFO sensor polling, psutil, freq history, alerts, commit charge (ctypes) |
 | `_collect_gpu` | **1s** | `@work(thread, exclusive)` | pynvml GPU status (Clocks Event Reasons) + diagnostics (decoder/encoder/mem util) + Ping (ICMP echo) + PCIe RX/TX throughput |
 | `_log_tick` | **1s** | Main thread | CSV log append (file I/O < 1ms) |
-| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, swap, weather, external IP, TCP |
+| `_collect_slow_tasks` | **5s** | `@work(thread, exclusive)` | top CPU process, weather, external IP, TCP |
 | `hwinfo-restart` daemon thread | **1s** | `threading.Thread` (daemon) | HWiNFO64 定时重启状态机 + 启动巡检（与 Textual worker 完全解耦） |
 
 - **HWiNFO 重启状态机跑在专用守护线程**（`_hwinfo_restart_loop`，evtlog 同款模式）：原实现位于 `_collect_slow_tasks` 末尾，而 `@work(thread, exclusive)` 在前次调用未完成时跳过新调用——`psutil.net_connections()`/天气 HTTP 等慢任务实测可阻塞 20~100s（hwinfo_restart.log 可见强杀成功后无阶段1日志，按 r 键才恢复），导致强杀后永远轮不到启动。专用线程 1s 轮询状态机，r 键仍只写标量标志，1s 内生效。
@@ -63,6 +63,7 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 | MELCHIOR | iCORE | iGPU `GPU Utilization` via HWiNFO `hw_contains="radeon"` | >0% → green/yellow/red 三级着色, else `IDLE` |
 | MELCHIOR | LIMIT | HWiNFO `CPU TDC Limit` / `CPU EDC Limit` (%) | `LIMIT TDCxx% EDCxx%`，<30 绿 / <70 黄 / ≥70 红 |
 | MELCHIOR | border flash (fuse_crit) | CPU Package power + `cpu_freq_nom` | 50W+4700MHz → CRITICAL 闪烁（与 PROCHOT 警报独立） |
+| BALTHASAR | COMMIT | `GetPerformanceInfo`（psapi，ctypes 直读）CommitTotal/CommitLimit | 提交量（虚拟内存）bar，<60% 绿 / <80% 黄 / ≥80% 红1；原 SWAP 行已废弃 |
 | BALTHASAR | MEMTMP | HWiNFO `SPD Hub Temperature` + `Drive Temperature` via `hw_contains="sn850x"/"spcc"/"sa510"` | `RM{val} WD{val} SP{val} ST{val} °C`, 白标签+色数值 |
 | BALTHASAR | PCIe | HWiNFO `PCIe Link Speed` (GT/s) via `hw_contains="nvidia"` | PCIe 链路速率, ≥16GT/s green, ≥8GT/s yellow |
 | BALTHASAR | DISK | `psutil.disk_io_counters` R+W 总和 | 方块 sparkline, y_range=(0,200), 绿/黄/红三色 |
@@ -72,9 +73,9 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 ## Crash Recovery Log (`logs/crash_log.csv`)
 
 - **Purpose**: Last 30 min of sensor data before abnormal shutdown (no BSOD dump)
-- **Columns** (31 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vddcr_v,mem_pct,mem1_temp,mem2_temp,nvme1_temp,nvme2_temp,sata_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,psu_v,v3vc,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
+- **Columns** (33 fields): `time,cpu_load,cpu_temp,cpu_pkg_w,cpu_eff_freq,cstate,cpu_fan,cpu_vddcr_v,mem_pct,commit_pct,commit_used_gb,mem1_temp,mem2_temp,nvme1_temp,nvme2_temp,xhci_temp,gpu_load,gpu_temp,gpu_mem_junc_temp,gpu_pwr,gpu_core_freq,gpu_volt,vram_pct,gpu_status,gpu_pstate,psu_v,v3vc,top_proc,top_cpu,gpu_decoder_util,gpu_encoder_util,gpu_mem_util,gpu_clk_reasons`
 - **Writing**: `_log_tick()` every 1s, simple `open+append` on main thread
-- **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)
+- **Startup pruning**: `_init_log()` retains only rows within 1800s of current time (cross-midnight safe)，并丢弃字段数与当前 `LOG_COLUMNS` 不符的旧行（列结构变更后避免与新表头错位）
 - **Size cap**: `LOG_MAX_BYTES = 512KB` → auto trims to half when exceeded
 - **Silent failure**: All I/O exceptions caught, never crashes the app
 
@@ -105,10 +106,12 @@ Use WT dropdown → **MAGI Monitor** profile (pre-configured with `elevate: true
 - **MAGIScanner matching is end-anchored**: `get_val()` uses regex `(?:^|\W)target$` instead of substring match to avoid `Cores (Average)` hitting `Cores (Average Effective)`, and `Core #1` hitting `Core #10`. Per-core lookup uses `get_core_freq()` with `startswith` for additional safety.
 - **iGPU 共存时用 `hw_contains` 过滤**：`get_val()` 支持 `hw_contains` 参数，GPU 查询传入 `"nvidia"` 确保独显传感器不被 iGPU 同名传感器干扰。所有 GPU HWiNFO 查询统一使用此过滤。
 - **Alert thresholds are intentionally tiered**: 高温 Toast 警报已完全移除，改为 PROCHOT 过热降频警报（见上）。边框闪烁（`fuse_crit`）由 CPU 功耗 + 频率驱动（50W+4700MHz → CRITICAL），与 Toast 警报独立，不应统一。
+- **BALTHASAR `COMMIT` 行 = 提交量（虚拟内存），不是页文件占用**：原 SWAP 行读 `psutil.swap_memory()`，Windows 上返回 **pagefile.sys 物理占用**（真被换出落盘的字节数），仅在物理内存紧张时才增长，故常年恒定——实测页文件 110MB/16GB = **0.7%**（WMI `Win32_PageFileUsage` 与 HWiNFO `Page File Used` 三方一致），同时刻提交量却已达 **23.1GB/47.1GB = 49%**。程序因内存耗尽崩溃撞的是提交上限（内存 + 页文件），不是页文件写满，因此该行对预警毫无信息量。现改为 ctypes 直读 `GetPerformanceInfo`（psapi，Win7+ 转发到 kernel32，用户态、无需提权、无子进程，也不依赖 HWiNFO——重启期间照常有效），取 `CommitTotal/CommitLimit` 换算 GB；采样放在 0.2s 的 `_collect()` 内以跟上暴涨速度。HWiNFO 侧另有 `Virtual Memory Load/Committed/Available` 同名传感器（数值与 `GetPerformanceInfo` 完全一致），但未采用。**本机提交上限算术**：上限 = 物理 31.08GB + 页文件当前实际大小，页文件配置 16G/32G(min/max，min 决定地板、max 只是允许增长的天花板，非预分配) → 地板 **47.08GB**、天花板 **63.08GB**。历史事故：旧配置 min4G/max16G 使地板仅 35.08GB、天花板仅 47.08GB，某程序一次性提交 29GB 叠加 ~23GB 基线（≈52GB）直接撞穿上限，全程序崩溃——改行换指标的直接起因。初次调整已把 min 提到 16G（地板 35→47GB）；若某天要彻底消除「边扩容边分配」的竞态，可设 32G/32G（代价：常驻 32GB 磁盘 + 含盘 BSOD 完整内存转储失效）。
 - **Panel titles are plain text**: After removing the unstable Ollama monitoring feature, panel titles show simple names (MELCHIOR / BALTHASAR / CASPER).
 
 ## Completed Fixes
 
+- **BALTHASAR SWAP 行 → COMMIT 行（页文件占用 → 提交量）** — 原 SWAP 行显示 `psutil.swap_memory().percent`，即 pagefile.sys 物理占用，内存爆炸时仍显示 0.7%（实测页文件 110MB vs 提交量 23.1GB/47.1GB=49%），无法预警。改为 `read_commit_charge()`（ctypes `GetPerformanceInfo`，psapi 回退 kernel32）读取 `CommitTotal/CommitLimit`，`state.update_commit()` 挂在 0.2s `_collect()` 中（原 5s `_collect_slow_tasks` 的 `update_swap()` 调用已移除）；面板行 `COMMIT` 沿用 `generate_bar` + 阈值色（<60 绿 / <80 黄 / ≥80 红1）。crash_log.csv 新增 `commit_pct`、`commit_used_gb` 两列（33 列），并顺带修正 `_init_log()` 裁剪时不校验字段数导致列结构变更后旧行与新表头错位的问题
 - **CASPER BOOST 状态失效根治（新驱动新增常驻 clock event reason 位）** — 驱动 616.92 起 NVML 新增 `0x200` Board Limit / `0x400` Reliability 位，本机 Reliability 常驻（`nvmlDeviceGetCurrentClocksEventReasons` 恒为 `0x400`，nvidia-smi 仅 `Reliability: Active`），原 `reasons == 0` 判定使 BOOST 永远不可达（高负载只显示 NORM）。改为 `_GPU_THROTTLE_MASK` 掩码判定（热/功耗降频位，含此前漏掉的 `HwSlowdown` 0x8）：仅热/功耗降频阻止 BOOST，未知新位向前兼容不阻塞；nvidia-ml-py 13.595.45/13.610.43 均未定义这两个新常量，故在模块内自行掩码
 - **HWiNFO 重启失败根治（ETW 孤儿会话撞名 0xC0000035）** — 事件 ID 2 `Session "HWiNFO64" failed to start ... 0xC0000035`（STATUS_OBJECT_NAME_COLLISION）。HWiNFO 的 PresentMon 传感器注册 ETW 追踪会话 `HWiNFO64`，由 Performance Logs 服务托管（`logman query -ets` 可见 `Schedules: On`），`taskkill /F` 强杀进程后会话仍存活；下次启动 `StartTrace("HWiNFO64")` 撞名 → 初始化失败退出 → 每次重试撞同一孤儿会话。两处修复：① 阶段0 先 `taskkill`（无 /F，发 WM_CLOSE）等待 `HWiNFO_GRACE_WAIT_SEC`(3s) 再 `/F`，给 HWiNFO 优雅退出窗口自行清理；② `_launch_hwinfo` 启动前 `logman stop "HWiNFO64" -ets` 清孤儿会话（returncode 1168=不存在 忽略；覆盖定时重启/r 键/巡检/重试所有启动路径）
 - **HWiNFO 定时强杀后不自动重启（空转）根治** — 日志铁证：`阶段0 强杀 returncode=0` 后无任何阶段1日志，按 r 键才恢复。三处加固：① `_safe_notify` 不再从守护线程直调 `self.notify()`（Textual 消息泵非线程安全，可能阻塞/崩溃），改为压入队列由主线程 `_tick` 每 0.2s 排空（与 evtlog 告警同款模式）；② 阶段0 强杀后轮询确认进程真正消失（`HWiNFO_KILL_SETTLE_POLLS`×`HWiNFO_KILL_SETTLE_STEP` 合计 ~3s），修复 taskkill 返回 0 后进程表残留数十毫秒导致 `_hwinfo_alive()` 误判「强杀失败」→ 空等 11h40m 的竞态；③ 启动巡检由单次改为连续看门狗（30s 节流）：状态机空闲且 HWiNFO 缺席 → 自动拉起并重新锚定下次重启时刻；阶段 1/2 停留超过 `HWiNFO_WEDGE_RESET_SEC`(120s) → 判定卡死强制重置走 R 键同款路径。此后「杀得掉、拉不起」任一环节静默失败都能在 ~30s 内自愈

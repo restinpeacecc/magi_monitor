@@ -105,7 +105,7 @@ LOG_MAX_BYTES = 512 * 1024         # 512 KB
 LOG_COLUMNS = [
     "time","cpu_load","cpu_temp","cpu_pkg_w","cpu_eff_freq","cstate","cpu_fan",
     "cpu_vddcr_v",
-    "mem_pct","mem1_temp","mem2_temp",
+    "mem_pct","commit_pct","commit_used_gb","mem1_temp","mem2_temp",
     "nvme1_temp","nvme2_temp","xhci_temp",
     "gpu_load","gpu_temp","gpu_mem_junc_temp","gpu_pwr","gpu_core_freq","gpu_volt","vram_pct","gpu_status","gpu_pstate",
         "psu_v","v3vc",
@@ -183,10 +183,12 @@ class MagiState:
         self.aux_fan1 = "0"
         self.aux_fan2 = "0"
 
-        # Swap
-        self.swap_pct: float = 0.0
-        self.swap_used_gb: float = 0.0
-        self.swap_total_gb: float = 0.0
+        # 提交量（Commit Charge = 虚拟内存账本：物理 + 页文件）
+        # 注意：不是页文件物理占用（psutil.swap_memory 在 Windows 上返回后者，
+        # 系统仅在物理内存紧张才真正落盘，因此常年恒定、无法预警内存耗尽）
+        self.commit_pct: float = 0.0
+        self.commit_used_gb: float = 0.0
+        self.commit_limit_gb: float = 0.0
 
         self.alert_level = 0           # 0:正常, 1:警告, 2:危险
         self.last_alert_time = 0.0     # 防止重复通知
@@ -384,16 +386,15 @@ class MagiState:
         self._last_disk_io = now_io
         self._last_time    = now_time
 
-    # ── Swap ─────────────────────────────────────────────────────────────────
+    # ── 提交量（Commit Charge / 虚拟内存）─────────────────────────────────────
 
-    def update_swap(self):
-        try:
-            s = psutil.swap_memory()
-            self.swap_pct = s.percent
-            self.swap_used_gb = s.used / (1024**3)
-            self.swap_total_gb = s.total / (1024**3)
-        except Exception:
-            pass
+    def update_commit(self):
+        """提交量采样；读取失败保留上次值（不清零）"""
+        used, limit, pct = read_commit_charge()
+        if limit > 0:
+            self.commit_used_gb = used
+            self.commit_limit_gb = limit
+            self.commit_pct = pct
 
     # ── 天气（每30分钟更新一次）──────────────────────────────────────────────────
 
@@ -769,6 +770,61 @@ def ratio_to_cstate(ratio: float) -> str:
     return "C7"
 
 
+# ── 提交量（Commit Charge / 虚拟内存）────────────────────────────────────────
+# Windows 提交量 = 物理内存 + 页文件 的虚拟内存账本（任务管理器「已提交」栏）。
+# 内存耗尽崩溃（分配失败）撞的是这条线，而非页文件物理占用，故 BALTHASAR 用它替换 SWAP。
+
+class _PerformanceInformation(ctypes.Structure):
+    """GetPerformanceInfo 结构体；前 11 个字段为页数，乘 PageSize 得字节数"""
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("CommitTotal", ctypes.c_size_t),        # 当前已提交页数
+        ("CommitLimit", ctypes.c_size_t),        # 提交上限页数（物理 + 页文件）
+        ("CommitPeak", ctypes.c_size_t),         # 开机以来峰值页数
+        ("PhysicalTotal", ctypes.c_size_t),
+        ("PhysicalAvailable", ctypes.c_size_t),
+        ("SystemCache", ctypes.c_size_t),
+        ("KernelTotal", ctypes.c_size_t),
+        ("KernelPaged", ctypes.c_size_t),
+        ("KernelNonpaged", ctypes.c_size_t),
+        ("PageSize", ctypes.c_size_t),           # 页大小（字节）
+        ("HandleCount", wintypes.DWORD),
+        ("ProcessCount", wintypes.DWORD),
+        ("ThreadCount", wintypes.DWORD),
+    ]
+
+
+_commit_fn = None   # 惰性缓存的 GetPerformanceInfo 函数指针
+
+
+def read_commit_charge() -> tuple[float, float, float]:
+    """读取系统提交量，返回 (已提交GB, 上限GB, 使用率%)；失败返回 (0.0, 0.0, 0.0)。
+
+    GetPerformanceInfo 位于 psapi.dll（Win7+ 为 kernel32 转发），用户态直读、
+    无需提权、无子进程，也不依赖 HWiNFO（重启期间同样有效）。
+    """
+    global _commit_fn
+    try:
+        if _commit_fn is None:
+            try:
+                fn = ctypes.windll.psapi.GetPerformanceInfo
+            except OSError:
+                fn = ctypes.windll.kernel32.GetPerformanceInfo
+            fn.argtypes = [ctypes.POINTER(_PerformanceInformation), wintypes.DWORD]
+            fn.restype = wintypes.BOOL
+            _commit_fn = fn
+        pi = _PerformanceInformation()
+        if not _commit_fn(ctypes.byref(pi), ctypes.sizeof(pi)):
+            return 0.0, 0.0, 0.0
+        page = pi.PageSize or 4096
+        used = pi.CommitTotal * page / (1024 ** 3)
+        limit = pi.CommitLimit * page / (1024 ** 3)
+        pct = pi.CommitTotal / pi.CommitLimit * 100.0 if pi.CommitLimit else 0.0
+        return used, limit, pct
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
 def generate_bar(percent, width: int = 15, color: str = "green") -> str:
     p      = max(0.0, min(100.0, float(percent)))
     filled = int(p / 100 * width)
@@ -1074,7 +1130,8 @@ def build_balthasar() -> Panel:
     _avail = parse_n(state.avail_gb)
     _free_color = "green" if _avail > 15 else "yellow" if _avail > 10 else "red1"
     t.add_row("FREE",   f"[bold {_free_color}]{state.avail_gb or 'N/A'}[/]")
-    t.add_row("SWAP",   generate_bar(state.swap_pct, color="magenta"))
+    _commit_color = "green" if state.commit_pct < 60 else "yellow" if state.commit_pct < 80 else "red1"
+    t.add_row("COMMIT", generate_bar(state.commit_pct, color=_commit_color))
     t.add_row("PSU",    f"[dim]12V[/][cadet_blue]{state.psu_v:.3f}[/] [dim]3V3[/][cadet_blue]{state.v3vc:.3f}[/] V")
     t.add_row("NET-DN", net_display)
     _wd = f"[dim]WD[/][bold {get_temp_color(state.nvme1_temp)}]{state.nvme1_temp:.0f}[/]"
@@ -1622,6 +1679,9 @@ class MAGIApp(App):
         if avail_gb:
             state.avail_gb = f"{parse_n(avail_gb) / 1024:.0f} GB"
 
+        # 提交量（虚拟内存）：ctypes 直读，随 0.2s tick 采样以跟上暴涨速度
+        state.update_commit()
+
         net_val = scanner.get_val("Current DL Rate", "KB/s", hw_contains="rtl8125")
         if net_val:
             state.net_dn_raw = f"{parse_n(net_val):.2f} KB/s"
@@ -1689,7 +1749,6 @@ class MAGIApp(App):
     def _collect_slow_tasks(self) -> None:
         """5s tick：TCP/进程/天气/外网IP/HWiNFO64 定时重启——worker 线程低频，避免阻塞主线程"""
         state.update_top_process()
-        state.update_swap()
         state.update_weather()  # HTTP (wttr.in) 每30分钟更新
         state.update_external_ip()  # HTTP (api.ipify.org) 每30分钟更新
         state.update_tcp_counts()
@@ -1957,9 +2016,10 @@ class MAGIApp(App):
             if len(lines) > 1:
                 now_ts = time.time()
                 keep = [",".join(LOG_COLUMNS)]  # header：与当前 LOG_COLUMNS 强制对齐
+                expect_sep = len(LOG_COLUMNS) - 1   # 列结构变更后丢弃字段数不符的旧行，避免错位
                 for line in lines[1:]:
                     parts = line.split(",", 1)
-                    if len(parts) > 1:
+                    if len(parts) > 1 and line.count(",") == expect_sep:
                         try:
                             t = datetime.strptime(parts[0], "%m-%d %H:%M:%S")
                             t = t.replace(year=datetime.now().year)
@@ -1983,7 +2043,8 @@ class MAGIApp(App):
                 f"{t},{s.cpu_load:.1f},{s.cpu_temp:.1f},{s.current_cpu_power:.1f},"
                 f"{s.cpu_eff_freq:.0f},{s.cpu_cstate_level},{s.cpu_fan},"
                 f"{s.cpu_vddcr_v:.3f},"
-                f"{s.used_p:.1f},{s.mem1_temp:.1f},{s.mem2_temp:.1f},"
+                f"{s.used_p:.1f},{s.commit_pct:.1f},{s.commit_used_gb:.1f},"
+                f"{s.mem1_temp:.1f},{s.mem2_temp:.1f},"
                 f"{s.nvme1_temp:.1f},{s.nvme2_temp:.1f},{s.xhci_temp:.1f},"
                 f"{s.gpu_load:.1f},{s.gpu_temp:.1f},{s.gpu_mem_junc_temp:.1f},"
                 f"{s.current_gpu_power:.1f},{_gfreq_last:.0f},"
